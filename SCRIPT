@@ -860,9 +860,9 @@ function FX.applyTheme(o)
         FX.dotPanel = o.onlinePanel
     end)
     pcall(function()
-        o.creditLabel.TextColor3 = Color3.fromRGB(255,255,255)
+        o.creditLabel.TextColor3 = T.GOLD
         local cg = Instance.new("UIGradient")
-        cg.Color = ColorSequence.new(T.ACCENT, T.ACCENT_2) cg.Rotation = 20 cg.Parent = o.creditLabel
+        cg.Color = ColorSequence.new(T.GOLD, T.GOLD_2) cg.Rotation = 20 cg.Parent = o.creditLabel
     end)
     pcall(function()
         o.inputBox.BackgroundColor3 = T.INPUT o.inputBox.BorderSizePixel = 0
@@ -1843,7 +1843,7 @@ local function buildUI()
     local creditLabel = Instance.new("TextLabel")
     creditLabel.Size=UDim2.new(1,-20,1,-20) creditLabel.Position=UDim2.new(0,10,0,10)
     creditLabel.BackgroundTransparency=1 creditLabel.Text=CREDIT_TEXT
-    creditLabel.TextColor3=Color3.fromRGB(0,200,255) creditLabel.TextSize=12
+    creditLabel.TextColor3=FX.T.GOLD creditLabel.TextSize=12
     creditLabel.Font=Enum.Font.GothamBold
     creditLabel.TextXAlignment=Enum.TextXAlignment.Center
     creditLabel.TextYAlignment=Enum.TextYAlignment.Center creditLabel.Parent=creditPanel
