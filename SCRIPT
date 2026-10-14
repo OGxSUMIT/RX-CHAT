@@ -3795,7 +3795,7 @@ local function buildUI()
             end
         end)
 
-        if isLocal==false then
+        if isLocal==false and not frame.Visible then
             unread = unread+1
             badge.Text = tostring(math.min(unread, 99))
             badge.Visible=true
@@ -4746,7 +4746,7 @@ local function buildUI()
                     e1, e2 = isEmpty(MX.root), isEmpty(MX.index)
                 end
                 if e1==true and e2==true then
-                    addSystemMessage("All server music deleted from Firebase (verified empty). Local rx_music files were kept.", Color3.fromRGB(255,200,100))
+                    addSystemMessage("All server music deleted from Firebase\n(verified empty).\nLocal rx_music files were kept.", Color3.fromRGB(255,200,100))
                 elseif e1==false or e2==false then
                     addSystemMessage("Delete sent but Firebase still has music (check database rules).", Color3.fromRGB(255,100,100))
                 else
