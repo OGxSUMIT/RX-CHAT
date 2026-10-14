@@ -1,5 +1,5 @@
--- RX Chat V9.7.2 - Lag Free + Join Dedup + Green Dot + Blue Toast Top-Right | UI Upgrade: neon glass theme + animations
-print("[RX] V9.7.2 booting…")
+-- RX Chat V10 - reference chat logic + synced rx_music library
+print("[RX] V10 booting…")
 
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
@@ -82,6 +82,16 @@ local STICKERS_URL = STICKERS_ROOT..".json"
 local WORKSPACE_MEME_FOLDER = "rx_memes"
 local SYNCED_MEMES_ROOT = FIREBASE_ROOT.."/synced_memes"
 local SYNCED_MEMES_URL = SYNCED_MEMES_ROOT..".json"
+
+-- RX MUSIC LIBRARY (mp3 sync): workspace/rx_music  <->  Firebase /synced_music (chunks) + /synced_music_index (names)
+local MX = {
+    folder = "rx_music",
+    root = FIREBASE_ROOT.."/synced_music",        -- synced_music/<hash>/c0001..  (audio chunks)
+    index = FIREBASE_ROOT.."/synced_music_index", -- synced_music_index/<hash>    (name, size, chunks)
+    maxBytes = 8000000,   -- max mp3 size (8 MB)
+    chunkRaw = 450000,    -- raw bytes per Firebase chunk (divisible by 3 -> clean base64)
+    token = 0, hashCache = {}, inflight = {}, inflightUp = {}, lastDedup = 0, library = {}, busy = false,
+}
 
 local MAX_MEME_BYTES = 900000
 
@@ -538,6 +548,14 @@ end
 
 local connections = {}
 local downloadedStickerFiles = {}
+-- duplicate-fetch guard: if the same meme hash is already being downloaded, wait for it (stale after 15s)
+local stickerFetchInFlight = {}
+local function waitStickerFetch(hash)
+    local started = os.clock()
+    while stickerFetchInFlight[hash] and os.clock()-started < 15 and os.clock()-stickerFetchInFlight[hash] < 15 do
+        task.wait(0.1)
+    end
+end
 local fileExistsForHash
 local function cleanup()
     for _,c in ipairs(connections) do pcall(function() c:Disconnect() end) end
@@ -1469,6 +1487,7 @@ local function buildUI()
     local createMusicPanel
 
     stopAllMusicSafe = function(sweepWorkspace)
+        MX.token = MX.token + 1
         pcall(function()
             local s = currentSound
             currentSound = nil
@@ -1484,9 +1503,9 @@ local function buildUI()
         end)
     end
 
-    playMusicSafe = function(assetId, mType)
+    playMusicSafe = function(assetId, mType, rawSoundId)
         local clean = tostring(assetId):gsub("%D","")
-        if clean=="" or clean=="0" then
+        if not rawSoundId and (clean=="" or clean=="0") then
             if addSystemMessage then addSystemMessage("Invalid asset ID", Color3.fromRGB(255,100,100)) end
             return nil
         end
@@ -1499,7 +1518,7 @@ local function buildUI()
         local ok, err = pcall(function()
             s = Instance.new("Sound")
             s.Name="RX_Music"
-            s.SoundId="rbxassetid://"..clean
+            s.SoundId=rawSoundId or ("rbxassetid://"..clean)
             s.Volume=1
             s.Looped=false
             s.Parent=workspace
@@ -1523,6 +1542,445 @@ local function buildUI()
             end)
         end)
         return s
+    end
+
+
+    -- ==================================================================
+    -- RX MUSIC LIBRARY: .mp3 from workspace/rx_music, synced via Firebase (same idea as rx_memes)
+    -- ==================================================================
+    do
+        local RED = Color3.fromRGB(255,100,100)
+        local BLUE = Color3.fromRGB(150,200,255)
+        local function sysMsg(t, c) if addSystemMessage then addSystemMessage(t, c) end end
+        local function chunkKey(i) return string.format("c%04d", i) end
+
+        -- Full-file dual hash = Firebase key = dedupe key; local deletion also verifies exact bytes.
+        local function hashData(data)
+            if type(data)~="string" or #data==0 then return nil end
+            local n = #data
+            local h1, h2 = 5381, 0
+            for i = 1, n do
+                local byte = string.byte(data, i)
+                h1 = ((h1*33)+byte)%4294967296
+                h2 = ((h2*65599)+byte)%4294967296
+                if i%65536==0 then task.wait() end
+            end
+            return string.format("%08x%08x_%d", h1, h2, n)
+        end
+        -- Keep older V10 library entries readable while new uploads use the full-file hash above.
+        local function legacyHashData(data)
+            if type(data)~="string" or #data==0 then return nil end
+            local n, h = #data, 5381
+            local function feed(a, b)
+                for i=a,b do h=((h*33)+string.byte(data,i))%4294967296 end
+            end
+            if n<=12000 then
+                feed(1,n)
+            else
+                local mid=math.floor(n/2)
+                feed(1,4000) feed(mid-2000,mid+1999) feed(n-3999,n)
+            end
+            return string.format("%08x_%d",h,n)
+        end
+        local function hashFile(path)
+            if not readfile then return nil end
+            local ok, data = pcall(readfile, path)
+            if not ok then return nil end
+            return hashData(data)
+        end
+        local function fileMatchesHash(path, targetHash)
+            if not readfile then return false end
+            local ok, data = pcall(readfile, path)
+            return ok and (hashData(data)==targetHash or legacyHashData(data)==targetHash)
+        end
+
+        local function findLocal(hash)
+            if not listfiles then return nil end
+            local ok, files = pcall(listfiles, MX.folder)
+            if not ok or type(files)~="table" then return nil end
+            for _,f in ipairs(files) do
+                if tostring(f):lower():match("%.mp3$") then
+                    local h = MX.hashCache[f]
+                    if not h then h = hashFile(f) MX.hashCache[f] = h end
+                    if h == hash or fileMatchesHash(f, hash) then return f end
+                end
+            end
+            return nil
+        end
+
+        local function dedupeLocal(force)
+            local now = os.clock()
+            if not force and now - MX.lastDedup < 45 then return 0 end
+            MX.lastDedup = now
+            if not (listfiles and delfile and readfile) then return 0 end
+            ensureFolder(MX.folder)
+            local ok, files = pcall(listfiles, MX.folder)
+            if not ok or type(files)~="table" then return 0 end
+            local groups = {}
+            for _,f in ipairs(files) do
+                if tostring(f):lower():match("%.mp3$") then
+                    local h = MX.hashCache[f]
+                    if not h then h = hashFile(f) MX.hashCache[f] = h task.wait() end
+                    if h then
+                        groups[h] = groups[h] or {}
+                        table.insert(groups[h], f)
+                    end
+                end
+            end
+            local removed = 0
+            for h, paths in pairs(groups) do
+                if #paths > 1 then
+                    local scored = {}
+                    for _,f in ipairs(paths) do
+                        local fname = (tostring(f):match("([^/\\]+)$") or ""):lower()
+                        local base = fname:gsub("%.mp3$","")
+                        local score = (base==h and "1" or "0")..string.format("%04d", #fname)..fname
+                        scored[#scored+1] = {path=f, score=score}
+                    end
+                    table.sort(scored, function(a,b) return a.score < b.score end)
+                    local keepOk, keepData = pcall(readfile, scored[1].path)
+                    if keepOk and type(keepData)=="string" then
+                        for i = 2, #scored do
+                            local dataOk, candidateData = pcall(readfile, scored[i].path)
+                            if dataOk and candidateData==keepData and pcall(delfile, scored[i].path) then
+                                removed = removed + 1
+                                MX.hashCache[scored[i].path] = nil
+                            end
+                        end
+                    end
+                end
+            end
+            if removed > 0 then sysMsg("🧹 rx_music: removed "..removed.." duplicate song file(s)", Color3.fromRGB(100,255,100)) end
+            return removed
+        end
+        MX.dedupe = dedupeLocal
+
+        local function fetchIndex()
+            local d = jsonDecode(httpGetFresh(MX.index..".json") or "{}")
+            if type(d)~="table" then return {} end
+            return d
+        end
+
+        local function uploadCore(path, hash, name)
+            local existing = jsonDecode(httpGetFresh(MX.index.."/"..hash..".json") or "{}")
+            if type(existing)=="table" and existing.chunks then return true end
+            if not readfile then return false, "readfile unavailable" end
+            local ok, data = pcall(readfile, path)
+            if not ok or type(data)~="string" or #data==0 then return false, "could not read file" end
+            if #data > MX.maxBytes then
+                return false, string.format("too big (%.1f MB, max %.1f MB)", #data/1000000, MX.maxBytes/1000000)
+            end
+            local total = math.ceil(#data / MX.chunkRaw)
+            for i = 1, total do
+                local b64 = b64Encode(data:sub((i-1)*MX.chunkRaw+1, i*MX.chunkRaw))
+                if not b64 or b64=="" then return false, "encode failed" end
+                local body = jsonEncode({d=b64})
+                local url = MX.root.."/"..hash.."/"..chunkKey(i)..".json"
+                local put = nil
+                for _=1,3 do
+                    put = httpPut(url, body)
+                    if put then break end
+                    task.wait(0.5)
+                end
+                if not put then return false, "chunk "..i.."/"..total.." failed (check Firebase rules)" end
+                task.wait(0.05)
+            end
+            -- index is written LAST: if it exists, every chunk is already there
+            local put = httpPut(MX.index.."/"..hash..".json", jsonEncode({
+                name=name, size=#data, chunks=total, by=player.Name, timestamp=os.time()*1000
+            }))
+            if not put then return false, "index write failed" end
+            return true
+        end
+
+        local function uploadSong(path, hash, name)
+            if MX.inflightUp[hash] then return false, "already uploading" end
+            MX.inflightUp[hash] = true
+            local ok, a, b = pcall(uploadCore, path, hash, name)
+            MX.inflightUp[hash] = nil
+            if not ok then return false, tostring(a) end
+            return a, b
+        end
+
+        local function ensureLocal(hash)
+            local found = findLocal(hash)
+            if found then return found end
+            if MX.inflight[hash] then
+                local t0 = os.clock()
+                while MX.inflight[hash] and os.clock()-t0 < 90 do task.wait(0.25) end
+                return findLocal(hash)
+            end
+            MX.inflight[hash] = true
+            MX.lastError = nil
+            local resultPath = nil
+            local ok, err = pcall(function()
+                local meta = jsonDecode(httpGetFresh(MX.index.."/"..hash..".json") or "{}")
+                if type(meta)~="table" then MX.lastError = "invalid song metadata" return end
+                local total = tonumber(meta.chunks)
+                if not total or total < 1 or total%1~=0 or total>math.ceil(MX.maxBytes/MX.chunkRaw) then
+                    MX.lastError = "invalid or oversized song metadata (check synced_music_index rules)"
+                    return
+                end
+                local declaredSize = type(meta)=="table" and tonumber(meta.size) or nil
+                if meta.size~=nil and (not declaredSize or declaredSize<1 or declaredSize>MX.maxBytes) then
+                    MX.lastError = "invalid song size metadata"
+                    return
+                end
+                if declaredSize and math.ceil(declaredSize/MX.chunkRaw)~=total then
+                    MX.lastError = "song size/chunk metadata mismatch"
+                    return
+                end
+                local parts = {}
+                local totalBytes = 0
+                for i = 1, total do
+                    local d = nil
+                    for _=1,3 do
+                        local o = jsonDecode(httpGetFresh(MX.root.."/"..hash.."/"..chunkKey(i)..".json") or "{}")
+                        if type(o)=="table" and type(o.d)=="string" and o.d~="" then d = o.d break end
+                        task.wait(0.3)
+                    end
+                    if not d then MX.lastError = "chunk "..i.."/"..total.." could not be downloaded" return end
+                    local raw = b64Decode(d)
+                    if not raw or raw=="" then MX.lastError = "base64 decode failed" return end
+                    totalBytes = totalBytes + #raw
+                    if totalBytes>MX.maxBytes then MX.lastError = "download exceeds maximum song size" return end
+                    parts[i] = raw
+                    task.wait()
+                end
+                local data = table.concat(parts)
+                if declaredSize and #data~=declaredSize then MX.lastError = "downloaded size does not match metadata" return end
+                if hashData(data)~=hash and legacyHashData(data)~=hash then
+                    MX.lastError = "downloaded file is damaged (hash mismatch)"
+                    return
+                end
+                ensureFolder(MX.folder)
+                local path = MX.folder.."/"..hash..".mp3"
+                if writefile and pcall(writefile, path, data) then
+                    MX.hashCache[path] = hash
+                    resultPath = path
+                else
+                    MX.lastError = "writefile failed (executor can't save files)"
+                end
+            end)
+            MX.inflight[hash] = nil
+            if not ok then warn("[RX Music] download error: "..tostring(err)) end
+            return resultPath
+        end
+
+        -- plays a song from rx_music. t0 = os.clock() when the play command arrived (receivers seek forward by
+        -- the time spent downloading so everybody ends up on the same position)
+        MX.playSynced = function(hash, name, mType, byName, t0)
+            local myToken = MX.token
+            local label = tostring(name or "SONG")
+            local path = findLocal(hash)
+            if not path then
+                sysMsg("⬇ Loading song: "..label.."…", BLUE)
+                path = ensureLocal(hash)
+            end
+            if MX.token ~= myToken then return end
+            local asset = path and pathToAsset(path) or nil
+            if not (path and isUsableMemeAsset(asset)) then
+                if mType=="server" then isServerActive = false end
+                local why = path and "getcustomasset failed (executor can't play mp3 files)" or (MX.lastError or "download failed")
+                sysMsg("❌ Could not load song: "..label.." - "..why, RED)
+                return
+            end
+            if MX.token ~= myToken then return end
+            local s = playMusicSafe(hash, mType, asset)
+            if not s then
+                if mType=="server" then isServerActive = false end
+                return
+            end
+            if mType=="server" then
+                sysMsg("🔊 SERVER: "..label.." BY "..string.upper(tostring(byName or player.DisplayName)), Color3.fromRGB(0,255,150))
+            else
+                sysMsg("▶ Client: "..label, Color3.fromRGB(100,255,100))
+            end
+            if t0 then
+                task.spawn(function()
+                    local waited = 0
+                    while s.Parent and not s.IsLoaded and waited < 8 do task.wait(0.1) waited = waited + 0.1 end
+                    local el = os.clock() - t0
+                    pcall(function()
+                        if s.Parent and el > 1.5 and s.TimeLength > 0 and el < s.TimeLength - 1 then s.TimePosition = el end
+                    end)
+                end)
+            end
+        end
+
+        -- returns number of removed entries, or nil if the database could not be read (then nothing is deleted)
+        MX.cleanFirebase = function()
+            local ir = httpGetFresh(MX.index..".json")
+            if ir == nil or tostring(ir):find('"error"', 1, true) then return nil end
+            local idx = jsonDecode(ir)
+            if type(idx)~="table" then idx = {} end
+            local sr = httpGetFresh(MX.root..".json?shallow=true")
+            if sr == nil or tostring(sr):find('"error"', 1, true) then return nil end
+            local keys = jsonDecode(sr)
+            if type(keys)~="table" then keys = {} end
+            local removed = 0
+            for h in pairs(keys) do
+                local m = idx[h]
+                if not (type(m)=="table" and m.chunks) then
+                    if httpDelete(MX.root.."/"..h..".json") then removed = removed + 1 end
+                end
+            end
+            for h, m in pairs(idx) do
+                if type(m)=="table" and m.chunks and not keys[h] then
+                    if httpDelete(MX.index.."/"..h..".json") then removed = removed + 1 end
+                end
+            end
+            return removed
+        end
+
+        local function buildLibrary()
+            dedupeLocal(false)
+            ensureFolder(MX.folder)
+            local byHash, order = {}, {}
+            if listfiles then
+                local ok, files = pcall(listfiles, MX.folder)
+                if ok and type(files)=="table" then
+                    for _,f in ipairs(files) do
+                        if tostring(f):lower():match("%.mp3$") then
+                            local h = MX.hashCache[f]
+                            if not h then h = hashFile(f) MX.hashCache[f] = h task.wait() end
+                            if h and not byHash[h] then
+                                local fname = tostring(f):match("([^/\\]+)$") or "SONG"
+                                local e = {hash=h, name=(fname:gsub("%.[^.]+$","")), localPath=f}
+                                byHash[h] = e
+                                order[#order+1] = e
+                            end
+                        end
+                    end
+                end
+            end
+            for h, m in pairs(fetchIndex()) do
+                if type(m)=="table" and m.chunks then
+                    local e = byHash[h]
+                    if not e then e = {hash=h, name="SONG"} byHash[h] = e order[#order+1] = e end
+                    e.remote = true
+                    if m.name and m.name~="" then e.name = tostring(m.name) end
+                end
+            end
+            table.sort(order, function(a,b) return tostring(a.name):lower() < tostring(b.name):lower() end)
+            return order
+        end
+
+        local function broadcastSong(e)
+            if myRole=="none" then sysMsg("🔒 Locked - staff only", Color3.fromRGB(255,80,80)) return end
+            if not e.remote then
+                if not e.localPath then return end
+                sysMsg("☁ Uploading "..e.name.."… (first time only)", BLUE)
+                local ok, err = uploadSong(e.localPath, e.hash, e.name)
+                if not ok then sysMsg("❌ Upload failed: "..tostring(err), RED) return end
+                e.remote = true
+                if MX.refresh then MX.refresh() end
+            end
+            stopAllMusicSafe(true)
+            isServerActive = true
+            lastMusicTs = os.time()*1000
+            local msg = "🔊 SERVER MUSIC: "..e.name.." [SESSION]"
+            -- assetId "0" keeps older script versions harmless; new versions read musicType/musicHash
+            local payload = {assetId="0", musicAssetId="0", musicType="file", musicHash=e.hash, musicName=e.name,
+                action="play", musicAction="play", by=player.DisplayName, byUserId=player.UserId, role=myRole,
+                timestamp=lastMusicTs, isMusic=true, sessionOnly=true, name=player.Name, displayName=player.DisplayName,
+                id=generateGUID(), message=msg}
+            if addChatMessage then addChatMessage(player.DisplayName, msg, true, myRole, player.UserId, nil, nil, nil, nil, player.Name) end
+            task.spawn(function() pcall(function() httpPut(MUSIC_PRESENCE_URL, jsonEncode(payload)) end) end)
+            task.spawn(function() pcall(function() httpPost(FIREBASE_URL, jsonEncode(payload)) end) end)
+            MX.playSynced(e.hash, e.name, "server", nil, nil)
+        end
+
+        local uploadBusy = false
+        MX.uploadAll = function()
+            if myRole=="none" then sysMsg("🔒 Locked - staff only", Color3.fromRGB(255,80,80)) return end
+            if uploadBusy then return end
+            uploadBusy = true
+            task.spawn(function()
+                pcall(function()
+                    local n, fail = 0, 0
+                    for _,e in ipairs(MX.library) do
+                        if e.localPath and not e.remote then
+                            sysMsg("☁ Uploading "..e.name.."…", BLUE)
+                            local ok, err = uploadSong(e.localPath, e.hash, e.name)
+                            if ok then e.remote = true n = n + 1
+                            else fail = fail + 1 sysMsg("❌ "..e.name..": "..tostring(err), RED) end
+                        end
+                    end
+                    sysMsg("☁ rx_music sync done: "..n.." uploaded"..(fail>0 and (", "..fail.." failed") or ""), Color3.fromRGB(0,255,150))
+                end)
+                uploadBusy = false
+                if MX.refresh then MX.refresh() end
+            end)
+        end
+
+        local function renderRows(scroller, mode)
+            if not (scroller and scroller.Parent) then return end
+            for _,c in ipairs(scroller:GetChildren()) do
+                if c:IsA("GuiObject") then c:Destroy() end
+            end
+            if #MX.library==0 then
+                local empty = Instance.new("TextLabel")
+                empty.Size=UDim2.new(1,-8,0,60) empty.BackgroundTransparency=1
+                empty.TextWrapped=true empty.TextColor3=FX.T.DIM empty.Font=Enum.Font.Gotham
+                empty.TextSize=11 empty.ZIndex=202 empty.Parent=scroller
+                if writefile and readfile and listfiles then
+                    empty.Text="No songs yet.\nPut .mp3 files in your executor's workspace/rx_music folder, then press ↻"
+                else
+                    empty.Text="Your executor has no writefile / readfile / listfiles, so rx_music can't work."
+                end
+                return
+            end
+            for i, e in ipairs(MX.library) do
+                local row = Instance.new("Frame")
+                row.Size=UDim2.new(1,-6,0,28) row.LayoutOrder=i
+                row.BackgroundColor3=FX.T.PANEL row.BackgroundTransparency=0.35 row.BorderSizePixel=0
+                row.ZIndex=202 row.Parent=scroller
+                FX.corner(row, 8)
+                local nm = Instance.new("TextLabel")
+                nm.Size=UDim2.new(1,-132,1,0) nm.Position=UDim2.new(0,8,0,0) nm.BackgroundTransparency=1
+                nm.Text="🎵 "..e.name nm.TextColor3=FX.T.TEXT nm.Font=Enum.Font.GothamMedium nm.TextSize=11
+                nm.TextXAlignment=Enum.TextXAlignment.Left nm.ZIndex=203 nm.Parent=row
+                pcall(function() nm.TextTruncate=Enum.TextTruncate.AtEnd end)
+                local st = Instance.new("TextLabel")
+                st.Size=UDim2.new(0,34,1,0) st.Position=UDim2.new(1,-124,0,0) st.BackgroundTransparency=1
+                st.Text=(e.remote and e.localPath) and "☁💾" or (e.remote and "☁" or "💾")
+                st.TextColor3=FX.T.DIM st.Font=Enum.Font.Gotham st.TextSize=11 st.ZIndex=203 st.Parent=row
+                local pb = Instance.new("TextButton")
+                pb.Size=UDim2.new(0,76,0,22) pb.Position=UDim2.new(1,-82,0.5,-11) pb.BorderSizePixel=0
+                pb.Text=(mode=="server") and "▶ ALL" or "▶ Play"
+                pb.BackgroundColor3=(mode=="server") and FX.T.GOLD_2 or FX.T.OK pb.TextColor3=FX.T.BG
+                pb.Font=Enum.Font.GothamBold pb.TextSize=11 pb.ZIndex=203 pb.Parent=row
+                FX.corner(pb, 8) FX.press(pb)
+                pb.MouseButton1Click:Connect(function()
+                    if mode=="server" then
+                        task.spawn(function() pcall(broadcastSong, e) end)
+                    else
+                        if isServerActive then sysMsg("🔇 Server active! Stop server first.", RED) return end
+                        task.spawn(function()
+                            pcall(function()
+                                stopAllMusicSafe(false)
+                                MX.playSynced(e.hash, e.name, "client", nil, nil)
+                            end)
+                        end)
+                    end
+                end)
+            end
+        end
+
+        MX.refresh = function()
+            if MX.busy then return end
+            MX.busy = true
+            task.spawn(function()
+                local ok, err = pcall(function()
+                    MX.library = buildLibrary()
+                    renderRows(MX.clientList, "client")
+                    renderRows(MX.serverList, "server")
+                end)
+                MX.busy = false
+                if not ok then warn("[RX Music] library refresh failed: "..tostring(err)) end
+            end)
+        end
     end
 
     createMusicPanel = function()
@@ -1685,6 +2143,42 @@ local function buildUI()
         lI.TextColor3=FX.T.DANGER lI.Font=Enum.Font.GothamBlack
         lT.TextColor3=FX.T.DIM
 
+        -- rx_music song lists (CLIENT: play for you only | SERVER: upload + play for everyone)
+        local function makeSongArea(parentFrame, isServer)
+            local rb = Instance.new("TextButton")
+            rb.Size=UDim2.new(0,34,0,24) rb.Position=UDim2.new(0,0,0,52)
+            rb.BackgroundColor3=FX.T.PANEL_SOFT rb.BackgroundTransparency=0.15 rb.BorderSizePixel=0
+            rb.Text="🔄" rb.TextColor3=FX.T.TEXT rb.Font=Enum.Font.GothamBold rb.TextSize=15
+            rb.ZIndex=201 rb.Parent=parentFrame
+            FX.corner(rb, 8) FX.press(rb)
+            rb.MouseButton1Click:Connect(function() if MX.refresh then MX.refresh() end end)
+            local nextX = 40
+            if isServer then
+                local up = Instance.new("TextButton")
+                up.Size=UDim2.new(0,128,0,24) up.Position=UDim2.new(0,40,0,52)
+                up.BackgroundColor3=FX.T.ACCENT up.BackgroundTransparency=0.12 up.BorderSizePixel=0
+                up.Text="⬆ Upload rx_music" up.TextColor3=FX.T.BG up.Font=Enum.Font.GothamBold up.TextSize=11
+                up.ZIndex=201 up.Parent=parentFrame
+                FX.corner(up, 8) FX.press(up)
+                up.MouseButton1Click:Connect(function() if MX.uploadAll then MX.uploadAll() end end)
+                nextX = 174
+            end
+            local lg = Instance.new("TextLabel")
+            lg.Size=UDim2.new(1,-nextX,0,24) lg.Position=UDim2.new(0,nextX,0,52) lg.BackgroundTransparency=1
+            lg.Text="☁ synced   💾 on this device" lg.TextColor3=FX.T.DIM lg.Font=Enum.Font.Gotham
+            lg.TextSize=10 lg.TextXAlignment=Enum.TextXAlignment.Right lg.ZIndex=201 lg.Parent=parentFrame
+            local list = Instance.new("ScrollingFrame")
+            list.Size=UDim2.new(1,0,1,-84) list.Position=UDim2.new(0,0,0,82)
+            list.BackgroundTransparency=1 list.BorderSizePixel=0 list.ScrollBarThickness=3
+            list.AutomaticCanvasSize=Enum.AutomaticSize.Y list.CanvasSize=UDim2.new(0,0,0,0)
+            list.ZIndex=201 list.Parent=parentFrame
+            local lay = Instance.new("UIListLayout")
+            lay.Padding=UDim.new(0,4) lay.SortOrder=Enum.SortOrder.LayoutOrder lay.Parent=list
+            return list
+        end
+        MX.clientList = makeSongArea(clientMusicFrame, false)
+        MX.serverList = makeSongArea(serverMusicFrame, true)
+
         cTab.MouseButton1Click:Connect(function()
             pcall(function()
                 clientMusicFrame.Visible=true serverMusicFrame.Visible=false
@@ -1718,6 +2212,7 @@ local function buildUI()
         end)
         cS.MouseButton1Click:Connect(function()
             pcall(function()
+                if not isServerActive then MX.token = MX.token + 1 end
                 if currentMusicType=="client" then
                     stopAllMusicSafe(false); isServerActive=false
                     if addSystemMessage then addSystemMessage("⏹ Client stopped", Color3.fromRGB(200,200,200)) end
@@ -1798,8 +2293,15 @@ local function buildUI()
                                     lastMusicTs=ts
                                     stopAllMusicSafe(true)
                                     isServerActive=true
-                                    playMusicSafe(assetId,"server")
-                                    if addSystemMessage then addSystemMessage("🔊 SERVER: "..tostring(assetId):gsub("%D","").." BY "..string.upper(data.by or "STAFF"), Color3.fromRGB(0,255,150)) end
+                                    if data.musicType=="file" and tostring(data.musicHash or ""):match("^%x+_%d+$") then
+                                        local recvAt = os.clock()
+                                        local fHash, fName, fBy = tostring(data.musicHash), data.musicName, data.by or "STAFF"
+                                        if addSystemMessage then addSystemMessage("📥 Song from "..tostring(fBy)..": "..tostring(fName), Color3.fromRGB(150,200,255)) end
+                                        task.spawn(function() pcall(MX.playSynced, fHash, fName, "server", fBy, recvAt) end)
+                                    else
+                                        playMusicSafe(assetId,"server")
+                                        if addSystemMessage then addSystemMessage("🔊 SERVER: "..tostring(assetId):gsub("%D","").." BY "..string.upper(data.by or "STAFF"), Color3.fromRGB(0,255,150)) end
+                                    end
                                 end
                             else
                                 if ts~=0 then lastMusicTs=ts end
@@ -1821,6 +2323,7 @@ local function buildUI()
                 if not ok then warn("[RX Music] lazy create failed: "..tostring(err)) musicPanel=nil return end
             end
             musicPanel.Visible = not musicPanel.Visible
+            if musicPanel.Visible and MX.refresh then MX.refresh() end
         end)
     end)
 
@@ -2893,9 +3396,12 @@ local function buildUI()
                     task.spawn(function()
                         local newId = nil
                         ensureFolder(WORKSPACE_MEME_FOLDER)
+                        waitStickerFetch(stickerHash)
                         local existingPath = fileExistsForHash(stickerHash)
                         local path = existingPath
+                        local fetchToken = nil
                         if not path then
+                            fetchToken = os.clock() stickerFetchInFlight[stickerHash] = fetchToken
                             local r = httpGet(SYNCED_MEMES_ROOT.."/"..stickerHash..".json")
                             local d = jsonDecode(r or "{}")
                             if d and d.data and d.data~="" then
@@ -2913,6 +3419,7 @@ local function buildUI()
                                 end
                             end
                         end
+                        if fetchToken and stickerFetchInFlight[stickerHash]==fetchToken then stickerFetchInFlight[stickerHash] = nil end
                         if path then newId = pathToAsset(path) end
                         if newId and newId~="" and loading.Parent then
                             loading:Destroy()
@@ -2928,9 +3435,12 @@ local function buildUI()
                     task.wait(0.8)
                     if not loading.Parent then return end
                     local newId = nil
+                    waitStickerFetch(stickerHash)
                     local existingPath = fileExistsForHash(stickerHash)
                     local path = existingPath
+                    local fetchToken = nil
                     if not path then
+                        fetchToken = os.clock() stickerFetchInFlight[stickerHash] = fetchToken
                         local r = httpGet(SYNCED_MEMES_ROOT.."/"..stickerHash..".json")
                         local d = jsonDecode(r or "{}")
                         if d and d.data and d.data~="" then
@@ -2947,6 +3457,7 @@ local function buildUI()
                             end
                         end
                     end
+                    if fetchToken and stickerFetchInFlight[stickerHash]==fetchToken then stickerFetchInFlight[stickerHash] = nil end
                     if path then newId = pathToAsset(path) end
                     if newId and newId~="" and loading.Parent then
                         loading:Destroy()
@@ -3341,13 +3852,34 @@ local function buildUI()
             return false
         end
         stopMemeSync()
-        local stickersOk = httpPut(STICKERS_ROOT..".json", "{}") ~= nil
-        local syncedOk = httpPut(SYNCED_MEMES_ROOT..".json", "{}") ~= nil
-        if stickersOk and syncedOk then
-            addSystemMessage("All Server memes deleted. Local rx_memes files were kept.", Color3.fromRGB(255,200,100))
-            return true
+        -- true = node empty, false = still has data, nil = could not read it
+        local function nodeIsEmpty(root)
+            local resp = httpGetFresh(root..".json?shallow=true")
+            if resp == nil then return nil end
+            local s = tostring(resp):gsub("%s+","")
+            if s=="null" or s=="{}" then return true end
+            if s:find('"error"',1,true) then return nil end
+            return false
         end
-        addSystemMessage("Could not completely delete Server memes. Try again.", Color3.fromRGB(255,100,100))
+        local function wipe()
+            httpPut(STICKERS_ROOT..".json", "{}")
+            httpPut(SYNCED_MEMES_ROOT..".json", "{}")
+        end
+        wipe()
+        local e1, e2 = nodeIsEmpty(STICKERS_ROOT), nodeIsEmpty(SYNCED_MEMES_ROOT)
+        if e1==false or e2==false then
+            task.wait(0.5)
+            wipe()
+            e1, e2 = nodeIsEmpty(STICKERS_ROOT), nodeIsEmpty(SYNCED_MEMES_ROOT)
+        end
+        if e1==true and e2==true then
+            addSystemMessage("All Server memes deleted (verified empty). Local rx_memes files were kept.", Color3.fromRGB(255,200,100))
+            return true
+        elseif e1==false or e2==false then
+            addSystemMessage("Delete sent but Firebase still has memes (check database rules or request support).", Color3.fromRGB(255,100,100))
+            return false
+        end
+        addSystemMessage("Delete sent but could not verify Firebase is empty. Try /syncmemes later to check.", Color3.fromRGB(255,200,100))
         return false
     end
 
@@ -4061,16 +4593,68 @@ local function buildUI()
             end
             deleteAllServerMemes()
             return true
+        elseif cmd=="/dedupemusic" then
+            task.spawn(function()
+                local n = MX.dedupe and MX.dedupe(true) or 0
+                addSystemMessage("🧹 rx_music: "..n.." duplicate local file(s) removed", Color3.fromRGB(100,255,100))
+                if myRole=="owner" then
+                    local r = MX.cleanFirebase and MX.cleanFirebase()
+                    if r == nil then
+                        addSystemMessage("Firebase cleanup skipped (could not read rx_music, check rules).", Color3.fromRGB(255,100,100))
+                    else
+                        addSystemMessage("🧹 Firebase rx_music: "..r.." orphan entr"..(r==1 and "y" or "ies").." removed", Color3.fromRGB(100,255,100))
+                    end
+                else
+                    addSystemMessage("Firebase cleanup is owner-only.", Color3.fromRGB(255,200,100))
+                end
+                if MX.refresh then MX.refresh() end
+            end)
+            return true
+        elseif cmd=="/deleteallmusic" or cmd=="/clearmusic" then
+            if myRole~="owner" then
+                addSystemMessage("🚫 Unauthorized command: /deleteallmusic (owner only)", Color3.fromRGB(255,80,80))
+                return true
+            end
+            task.spawn(function()
+                -- true = node empty, false = still has data, nil = could not read it
+                local function isEmpty(root)
+                    local resp = httpGetFresh(root..".json?shallow=true")
+                    if resp == nil then return nil end
+                    local s = tostring(resp):gsub("%s+","")
+                    if s=="null" or s=="{}" then return true end
+                    if s:find('"error"',1,true) then return nil end
+                    return false
+                end
+                local function wipe()
+                    httpPut(MX.root..".json","{}")
+                    httpPut(MX.index..".json","{}")
+                end
+                wipe()
+                local e1, e2 = isEmpty(MX.root), isEmpty(MX.index)
+                if e1==false or e2==false then
+                    task.wait(0.5)
+                    wipe()
+                    e1, e2 = isEmpty(MX.root), isEmpty(MX.index)
+                end
+                if e1==true and e2==true then
+                    addSystemMessage("All server music deleted from Firebase (verified empty). Local rx_music files were kept.", Color3.fromRGB(255,200,100))
+                elseif e1==false or e2==false then
+                    addSystemMessage("Delete sent but Firebase still has music (check database rules).", Color3.fromRGB(255,100,100))
+                else
+                    addSystemMessage("Delete sent but could not verify Firebase is empty. Press the music refresh button to check.", Color3.fromRGB(255,200,100))
+                end
+                if MX.refresh then MX.refresh() end
+            end)
+            return true
         elseif cmd=="/showblockedusers" then
             showBlockedUsersWindow()
             return true
         elseif cmd=="/help" then
-            local helpCommands={"/clear","/clearall","/addmeme","/addmemeurl","/syncmemes","/stopmemessync","/stopsyncmemes","/reloadmemes","/memelist","/showblockedusers","/deleteallmemes","/help"}
-            if (ROLE_LEVELS[myRole] or 0)<2 then table.remove(helpCommands,#helpCommands-1) end
-            if myRole~="owner" then
-                for i,name in ipairs(helpCommands) do
-                    if name=="/deleteallmemes" then table.remove(helpCommands,i) break end
-                end
+            local helpCommands={"/clear","/clearall","/addmeme","/addmemeurl","/syncmemes","/stopmemessync","/stopsyncmemes","/reloadmemes","/memelist","/showblockedusers","/dedupemusic","/help"}
+            if myRole=="owner" then
+                table.insert(helpCommands, "/deleteallmemes")
+                table.insert(helpCommands, "/deleteallmusic")
+                table.insert(helpCommands, "/clearmusic")
             end
             addSystemMessage(table.concat(helpCommands,"\n"))
             return true
@@ -4108,6 +4692,7 @@ local function buildUI()
     addSystemMessage("Welcome to RX Chat, "..getNick(player.UserId, player.DisplayName).."!", Color3.fromRGB(200,220,255))
     addSystemMessage("/syncmemes to sync memes", Color3.fromRGB(100,255,100))
     addSystemMessage("/stopsyncmemes to stop", Color3.fromRGB(100,255,100))
+    addSystemMessage("Use the RX Music Player 🔄 button to sync rx_music", Color3.fromRGB(100,255,100))
     addSystemMessage("/help for commands", Color3.fromRGB(100,255,100))
     task.spawn(function()
         if alive then
@@ -4224,7 +4809,7 @@ local function buildUI()
         if not alive then return end
         safeRuntimeCall(function() refreshOnlineList(false) end)
     end)
-    print("[RX] buildUI() finished — RX Chat V9.7.2 Ready")
+    print("[RX] buildUI() finished — RX Chat V10 Ready")
 end
 
 local running = true
