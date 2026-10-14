@@ -1116,7 +1116,8 @@ local function buildUI()
 
     local titleText = Instance.new("TextLabel")
     titleText.Size=UDim2.new(1,-40,1,0) titleText.Position=UDim2.new(0,10,0,0)
-    titleText.BackgroundTransparency=1 titleText.Text="RX CHAT ⚡"
+    titleText.BackgroundTransparency=1 titleText.RichText=true
+    titleText.Text='RX CHAT <font color="#FFD700">⚡</font>'
     titleText.TextColor3=Color3.fromRGB(0,200,255) titleText.TextSize=13
     titleText.Font=Enum.Font.GothamBold titleText.TextXAlignment=Enum.TextXAlignment.Left
     titleText.Parent=titleBar
@@ -1593,6 +1594,63 @@ local function buildUI()
             local ok, data = pcall(readfile, path)
             return ok and (hashData(data)==targetHash or legacyHashData(data)==targetHash)
         end
+        local function localFileExists(path)
+            if isfile then
+                local ok, exists = pcall(isfile, path)
+                if ok and exists then return true end
+            end
+            if listfiles then
+                local ok, files = pcall(listfiles, MX.folder)
+                if ok and type(files)=="table" then
+                    local wanted = (tostring(path):match("([^/\\]+)$") or tostring(path)):lower()
+                    for _, f in ipairs(files) do
+                        local listed = (tostring(f):match("([^/\\]+)$") or tostring(f)):lower()
+                        if listed==wanted then return true end
+                    end
+                end
+            end
+            return false
+        end
+        local function localSongPath(meta, hash)
+            local filename = type(meta)=="table" and (meta.fileName or meta.name) or nil
+            filename = tostring(filename or hash):match("([^/\\]+)$") or tostring(hash)
+            filename = filename:gsub("[%c:*?\"<>|]", "_"):gsub("^%s+", ""):gsub("%s+$", "")
+            if filename=="" then filename=tostring(hash) end
+            if not filename:lower():match("%.mp3$") then filename=filename..".mp3" end
+            local path = MX.folder.."/"..filename
+            if not localFileExists(path) or fileMatchesHash(path, hash) then return path end
+            local stem = filename:gsub("%.mp3$", "")
+            local suffix = tostring(hash):sub(1,8)
+            for i=1,99 do
+                local tail = suffix..(i>1 and "_"..tostring(i) or "")
+                local candidate = MX.folder.."/"..stem.."_"..tail..".mp3"
+                if not localFileExists(candidate) or fileMatchesHash(candidate, hash) then return candidate end
+            end
+            return path
+        end
+        local function normalizeLocalSongName(path, hash)
+            if not path or not (readfile and writefile) then return path end
+            local currentName = tostring(path):match("([^/\\]+)$") or tostring(path)
+            if not currentName:match("^%x+_%d+%.mp3$") then return path end
+            local meta = jsonDecode(httpGetFresh(MX.index.."/"..hash..".json") or "{}")
+            if type(meta)~="table" or not (meta.fileName or meta.name) then return path end
+            local target = localSongPath(meta, hash)
+            if target==path then return path end
+            if localFileExists(target) and fileMatchesHash(target, hash) then
+                if delfile then pcall(delfile, path) end
+                MX.hashCache[path] = nil
+                MX.hashCache[target] = hash
+                return target
+            end
+            local readOk, data = pcall(readfile, path)
+            if not readOk or type(data)~="string" then return path end
+            local writeOk = pcall(writefile, target, data)
+            if not writeOk or not fileMatchesHash(target, hash) then return path end
+            if delfile then pcall(delfile, path) end
+            MX.hashCache[path] = nil
+            MX.hashCache[target] = hash
+            return target
+        end
 
         local function findLocal(hash)
             if not listfiles then return nil end
@@ -1670,6 +1728,8 @@ local function buildUI()
             if #data > MX.maxBytes then
                 return false, string.format("too big (%.1f MB, max %.1f MB)", #data/1000000, MX.maxBytes/1000000)
             end
+            local fileName = tostring(path):match("([^/\\]+)$") or tostring(name or "SONG")
+            if not fileName:lower():match("%.mp3$") then fileName=fileName..".mp3" end
             local total = math.ceil(#data / MX.chunkRaw)
             for i = 1, total do
                 local b64 = b64Encode(data:sub((i-1)*MX.chunkRaw+1, i*MX.chunkRaw))
@@ -1687,7 +1747,7 @@ local function buildUI()
             end
             -- index is written LAST: if it exists, every chunk is already there
             local put = httpPut(MX.index.."/"..hash..".json", jsonEncode({
-                name=name, size=#data, chunks=total, by=player.Name, timestamp=os.time()*1000
+                name=name, fileName=fileName, size=#data, chunks=total, by=player.Name, timestamp=os.time()*1000
             }))
             if not put then return false, "index write failed" end
             return true
@@ -1704,11 +1764,12 @@ local function buildUI()
 
         local function ensureLocal(hash)
             local found = findLocal(hash)
-            if found then return found end
+            if found then return normalizeLocalSongName(found, hash) end
             if MX.inflight[hash] then
                 local t0 = os.clock()
                 while MX.inflight[hash] and os.clock()-t0 < 90 do task.wait(0.25) end
-                return findLocal(hash)
+                local ready = findLocal(hash)
+                return ready and normalizeLocalSongName(ready, hash) or nil
             end
             MX.inflight[hash] = true
             MX.lastError = nil
@@ -1754,7 +1815,7 @@ local function buildUI()
                     return
                 end
                 ensureFolder(MX.folder)
-                local path = MX.folder.."/"..hash..".mp3"
+                local path = localSongPath(meta, hash)
                 if writefile and pcall(writefile, path, data) then
                     MX.hashCache[path] = hash
                     resultPath = path
@@ -1773,6 +1834,7 @@ local function buildUI()
             local myToken = MX.token
             local label = tostring(name or "SONG")
             local path = findLocal(hash)
+            if path then path = normalizeLocalSongName(path, hash) end
             if not path then
                 sysMsg("⬇ Loading song: "..label.."…", BLUE)
                 path = ensureLocal(hash)
@@ -1925,7 +1987,7 @@ local function buildUI()
                 empty.TextWrapped=true empty.TextColor3=FX.T.DIM empty.Font=Enum.Font.Gotham
                 empty.TextSize=11 empty.ZIndex=202 empty.Parent=scroller
                 if writefile and readfile and listfiles then
-                    empty.Text="No songs yet.\nPut .mp3 files in your executor's workspace/rx_music folder, then press ↻"
+                    empty.Text="No songs yet.\nPut .mp3 files in your executor's workspace/rx_music folder, then press 🔄"
                 else
                     empty.Text="Your executor has no writefile / readfile / listfiles, so rx_music can't work."
                 end
@@ -1938,16 +2000,16 @@ local function buildUI()
                 row.ZIndex=202 row.Parent=scroller
                 FX.corner(row, 8)
                 local nm = Instance.new("TextLabel")
-                nm.Size=UDim2.new(1,-132,1,0) nm.Position=UDim2.new(0,8,0,0) nm.BackgroundTransparency=1
+                nm.Size=UDim2.new(1,-184,1,0) nm.Position=UDim2.new(0,8,0,0) nm.BackgroundTransparency=1
                 nm.Text="🎵 "..e.name nm.TextColor3=FX.T.TEXT nm.Font=Enum.Font.GothamMedium nm.TextSize=11
                 nm.TextXAlignment=Enum.TextXAlignment.Left nm.ZIndex=203 nm.Parent=row
                 pcall(function() nm.TextTruncate=Enum.TextTruncate.AtEnd end)
                 local st = Instance.new("TextLabel")
-                st.Size=UDim2.new(0,34,1,0) st.Position=UDim2.new(1,-124,0,0) st.BackgroundTransparency=1
+                st.Size=UDim2.new(0,34,1,0) st.Position=UDim2.new(1,-174,0,0) st.BackgroundTransparency=1
                 st.Text=(e.remote and e.localPath) and "☁💾" or (e.remote and "☁" or "💾")
                 st.TextColor3=FX.T.DIM st.Font=Enum.Font.Gotham st.TextSize=11 st.ZIndex=203 st.Parent=row
                 local pb = Instance.new("TextButton")
-                pb.Size=UDim2.new(0,76,0,22) pb.Position=UDim2.new(1,-82,0.5,-11) pb.BorderSizePixel=0
+                pb.Size=UDim2.new(0,58,0,22) pb.Position=UDim2.new(1,-124,0.5,-11) pb.BorderSizePixel=0
                 pb.Text=(mode=="server") and "▶ ALL" or "▶ Play"
                 pb.BackgroundColor3=(mode=="server") and FX.T.GOLD_2 or FX.T.OK pb.TextColor3=FX.T.BG
                 pb.Font=Enum.Font.GothamBold pb.TextSize=11 pb.ZIndex=203 pb.Parent=row
@@ -1963,6 +2025,53 @@ local function buildUI()
                                 MX.playSynced(e.hash, e.name, "client", nil, nil)
                             end)
                         end)
+                    end
+                end)
+                local canDeleteLocal = type(e.localPath)=="string" and e.localPath~="" and type(delfile)=="function"
+                local deleteBtn = Instance.new("TextButton")
+                deleteBtn.Size=UDim2.new(0,56,0,22) deleteBtn.Position=UDim2.new(1,-62,0.5,-11)
+                deleteBtn.BorderSizePixel=0 deleteBtn.Text=canDeleteLocal and "Delete" or "N/A"
+                deleteBtn.BackgroundColor3=canDeleteLocal and FX.T.DANGER or FX.T.PANEL_SOFT
+                deleteBtn.TextColor3=canDeleteLocal and FX.T.TEXT or FX.T.DIM
+                deleteBtn.Font=Enum.Font.GothamBold deleteBtn.TextSize=10 deleteBtn.ZIndex=203
+                deleteBtn.Active=canDeleteLocal deleteBtn.AutoButtonColor=canDeleteLocal
+                deleteBtn.Parent=row
+                FX.corner(deleteBtn, 7)
+                if canDeleteLocal then FX.press(deleteBtn) end
+                local deleteArmed = false
+                deleteBtn.MouseButton1Click:Connect(function()
+                    local path = e.localPath
+                    if not path or path=="" then
+                        sysMsg("No local MP3 for this row; Firebase was not changed.", BLUE)
+                        return
+                    end
+                    if type(delfile)~="function" then
+                        sysMsg("This executor cannot delete local files.", RED)
+                        return
+                    end
+                    if not deleteArmed then
+                        deleteArmed = true
+                        deleteBtn.Text="Confirm?"
+                        task.delay(3, function()
+                            if deleteBtn.Parent and deleteArmed then
+                                deleteArmed = false
+                                deleteBtn.Text="Delete"
+                            end
+                        end)
+                        return
+                    end
+                    deleteArmed = false
+                    local deleteOk, deleteResult = pcall(delfile, path)
+                    local verifyOk, stillExists = true, false
+                    if isfile then verifyOk, stillExists = pcall(isfile, path) end
+                    if deleteOk and deleteResult~=false and verifyOk and not stillExists then
+                        MX.hashCache[path] = nil
+                        e.localPath = nil
+                        sysMsg("Deleted local MP3: "..tostring(e.name).." (Firebase copy unchanged)", Color3.fromRGB(100,255,100))
+                        if MX.refresh then MX.refresh() end
+                    else
+                        deleteBtn.Text="Delete"
+                        sysMsg("Could not delete local MP3: "..tostring(path), RED)
                     end
                 end)
             end
