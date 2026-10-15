@@ -1115,12 +1115,24 @@ local function buildUI()
     titleBar.BorderSizePixel=0 titleBar.Active=true titleBar.Parent=frame
 
     local titleText = Instance.new("TextLabel")
-    titleText.Size=UDim2.new(1,-40,1,0) titleText.Position=UDim2.new(0,10,0,0)
-    titleText.BackgroundTransparency=1 titleText.RichText=true
-    titleText.Text='RX CHAT <font color="#FFD700">⚡</font>'
+    local titleCaption = "RX CHAT"
+    local titleCaptionWidth = 70
+    pcall(function()
+        titleCaptionWidth = math.ceil(TextService:GetTextSize(titleCaption, 13, Enum.Font.GothamBlack, Vector2.new(200,30)).X) + 4
+    end)
+    titleText.Size=UDim2.new(0,titleCaptionWidth,1,0) titleText.Position=UDim2.new(0,10,0,0)
+    titleText.BackgroundTransparency=1 titleText.RichText=false
+    titleText.Text=titleCaption
     titleText.TextColor3=Color3.fromRGB(0,200,255) titleText.TextSize=13
     titleText.Font=Enum.Font.GothamBold titleText.TextXAlignment=Enum.TextXAlignment.Left
     titleText.Parent=titleBar
+
+    local titleLightning = Instance.new("TextLabel")
+    titleLightning.Size=UDim2.new(0,22,1,0) titleLightning.Position=UDim2.new(0,10+titleCaptionWidth,0,0)
+    titleLightning.BackgroundTransparency=1 titleLightning.Text="⚡"
+    titleLightning.TextColor3=Color3.fromRGB(255,215,0) titleLightning.TextSize=14
+    titleLightning.Font=Enum.Font.GothamBold titleLightning.TextXAlignment=Enum.TextXAlignment.Center
+    titleLightning.Parent=titleBar
 
     local closeBtn = Instance.new("TextButton")
     closeBtn.Size=UDim2.new(0,28,0,28) closeBtn.Position=UDim2.new(1,-28,0,0)
