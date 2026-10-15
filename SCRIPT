@@ -88,7 +88,7 @@ local MX = {
     folder = "rx_music",
     root = FIREBASE_ROOT.."/synced_music",        -- synced_music/<hash>/c0001..  (audio chunks)
     index = FIREBASE_ROOT.."/synced_music_index", -- synced_music_index/<hash>    (name, size, chunks)
-    maxBytes = 8000000,   -- max mp3 size (8 MB)
+    maxBytes = 180000000, -- max raw mp3 size; about 240 MB Base64, leaving margin under RTDB's 256 MB response limit
     chunkRaw = 450000,    -- raw bytes per Firebase chunk (divisible by 3 -> clean base64)
     token = 0, hashCache = {}, inflight = {}, inflightUp = {}, lastDedup = 0, library = {}, busy = false,
 }
@@ -1221,9 +1221,7 @@ local function buildUI()
     inputBox.PlaceholderText="Type a message..."
     inputBox.PlaceholderColor3=Color3.fromRGB(150,150,160)
     inputBox.Font=Enum.Font.Gotham inputBox.TextSize=13
-    inputBox.ClearTextOnFocus=false inputBox.TextWrapped=false
-    inputBox.ClipsDescendants=true inputBox.TextTruncate=Enum.TextTruncate.None
-    inputBox.TextYAlignment=Enum.TextYAlignment.Center
+    inputBox.ClearTextOnFocus=false inputBox.TextWrapped=true
     inputBox.TextXAlignment=Enum.TextXAlignment.Left inputBox.Parent=chatPanel
 
     local musicBtn = Instance.new("TextButton")
@@ -1496,7 +1494,12 @@ local function buildUI()
     local currentSound, currentMusicType, lastMusicTs, isServerActive
     currentSound=nil currentMusicType=nil lastMusicTs=SESSION_STARTED_AT isServerActive=false
     local MUSIC_PRESENCE_URL = PRESENCE_ROOT.."/music.json"
+    local MUSIC_READY_ROOT = PRESENCE_ROOT.."/musicReady"
     local MUSIC_SYNC_START_LEAD_MS = 5000
+    local MUSIC_READY_TIMEOUT_MS = 300000
+    local function safeMusicSessionId(value)
+        return tostring(value or ""):gsub("[^%w_%-]", "")
+    end
     local function sharedMusicClockMs()
         local ok, value = pcall(function() return workspace:GetServerTimeNow() end)
         if ok and tonumber(value) then return tonumber(value)*1000 end
@@ -1814,7 +1817,7 @@ local function buildUI()
                     task.wait(0.5)
                 end
                 if not put then return false, "chunk "..i.."/"..total.." failed (check Firebase rules)" end
-                task.wait(0.05)
+                task.wait(#data>8000000 and 0.75 or 0.05) -- throttle larger uploads; preserve existing pacing for <=8 MB files
             end
             -- index is written LAST: if it exists, every chunk is already there
             local put = httpPut(MX.index.."/"..hash..".json", jsonEncode({
@@ -2000,6 +2003,78 @@ local function buildUI()
             return order
         end
 
+        MX.prepareInFlight = MX.prepareInFlight or {}
+        local function reportMusicReady(sessionId, hash, ready, note)
+            local sid = safeMusicSessionId(sessionId)
+            if sid=="" then return false end
+            local body = jsonEncode({
+                userId=player.UserId, hash=tostring(hash or ""), ready=ready==true,
+                readyAt={ [".sv"]="timestamp" }, note=note and tostring(note):sub(1,120) or nil
+            })
+            return httpPut(MUSIC_READY_ROOT.."/"..sid.."/"..tostring(player.UserId)..".json", body)~=nil
+        end
+
+        MX.prepareSynced = function(hash, name, sessionId)
+            local sid = safeMusicSessionId(sessionId)
+            hash = tostring(hash or "")
+            if sid=="" or MX.activePrepareId~=sid then return false end
+            if MX.prepareInFlight[sid] then return false end
+            MX.prepareInFlight[sid] = true
+            local prepared, reason = false, nil
+            local ok, result, prepareReason = pcall(function()
+                local path = findLocal(hash)
+                if path then path = normalizeLocalSongName(path, hash) end
+                if not path then
+                    sysMsg("⬇ Preparing server song: "..tostring(name or "SONG"), BLUE)
+                    path = ensureLocal(hash)
+                end
+                if not path then return false, MX.lastError or "download failed" end
+                local asset = pathToAsset(path)
+                if not isUsableMemeAsset(asset) then return false, "local MP3 is not playable" end
+                return true, nil
+            end)
+            if ok and result==true then prepared=true
+            elseif not ok then reason=tostring(result)
+            else reason=tostring(prepareReason or MX.lastError or "download failed") end
+            MX.prepareInFlight[sid] = nil
+            if MX.activePrepareId==sid then
+                reportMusicReady(sid, hash, prepared, reason)
+                if not prepared then sysMsg("⚠ Could not prepare "..tostring(name or "SONG")..": "..tostring(reason or "unknown error"), RED) end
+            end
+            return prepared
+        end
+
+        local function readinessStatus(sessionId, hash)
+            local presenceRaw = httpGetFresh(PRESENCE_URL)
+            local presence = jsonDecode(presenceRaw or "{}")
+            if type(presence)~="table" then return false, nil, nil end
+            local nowMs = sharedMusicClockMs()
+            local reportedNow = tonumber(presence._now)
+            if reportedNow and reportedNow>0 then nowMs=reportedNow end
+            local clients = { [tostring(player.UserId)]=true }
+            for fbKey, entry in pairs(presence) do
+                if type(entry)=="table" then
+                    local uid = tostring(entry.userId or fbKey)
+                    local lastSeen = tonumber(entry.lastSeen) or 0
+                    if uid~="" and uid~="0" and uid~="nil" and lastSeen>0 and nowMs-lastSeen<40000 then
+                        clients[uid] = true
+                    end
+                end
+            end
+            local readyRaw = httpGetFresh(MUSIC_READY_ROOT.."/"..safeMusicSessionId(sessionId)..".json")
+            local readyData = jsonDecode(readyRaw or "{}")
+            if type(readyData)~="table" then readyData={} end
+            local total, missing = 0, 0
+            for uid in pairs(clients) do
+                total = total + 1
+                local ack = readyData[uid]
+                if type(ack)~="table" or ack.ready~=true or tostring(ack.hash or "")~=tostring(hash) then
+                    missing = missing + 1
+                end
+            end
+            return missing==0, missing, total
+        end
+
         local function broadcastSong(e)
             if myRole=="none" then sysMsg("🔒 Locked - staff only", Color3.fromRGB(255,80,80)) return end
             if not e.remote then
@@ -2012,18 +2087,69 @@ local function buildUI()
             end
             stopAllMusicSafe(true)
             isServerActive = true
+            local previousPrepare = MX.activePrepareId
+            local sessionId = safeMusicSessionId(generateGUID())
+            if sessionId=="" then sessionId=tostring(player.UserId).."_"..tostring(os.time()) end
+            MX.activePrepareId = sessionId
+            if previousPrepare then task.spawn(function() pcall(function() httpDelete(MUSIC_READY_ROOT.."/"..safeMusicSessionId(previousPrepare)..".json") end) end) end
             lastMusicTs = os.time()*1000
-            local startAt = sharedMusicClockMs() + MUSIC_SYNC_START_LEAD_MS
             local msg = "🔊 SERVER MUSIC: "..e.name.." [SESSION]"
-            -- assetId "0" keeps older script versions harmless; new versions read musicType/musicHash
+            -- Prepare/download first. The play state is published only after active clients acknowledge readiness.
             local payload = {assetId="0", musicAssetId="0", musicType="file", musicHash=e.hash, musicName=e.name,
-                action="play", musicAction="play", by=player.DisplayName, byUserId=player.UserId, role=myRole,
-                timestamp=lastMusicTs, startAt=startAt, isMusic=true, sessionOnly=true, name=player.Name, displayName=player.DisplayName,
-                id=generateGUID(), message=msg}
-            if addChatMessage then addChatMessage(player.DisplayName, msg, true, myRole, player.UserId, nil, nil, nil, nil, player.Name) end
-            task.spawn(function() pcall(function() httpPut(MUSIC_PRESENCE_URL, jsonEncode(payload)) end) end)
-            task.spawn(function() pcall(function() httpPost(FIREBASE_URL, jsonEncode(payload)) end) end)
-            MX.playSynced(e.hash, e.name, "server", nil, nil, startAt)
+                action="prepare", musicAction="prepare", by=player.DisplayName, byUserId=player.UserId, role=myRole,
+                timestamp=lastMusicTs, isMusic=true, sessionOnly=true, name=player.Name, displayName=player.DisplayName,
+                id=sessionId, sessionId=sessionId, message=msg}
+            if not httpPut(MUSIC_PRESENCE_URL, jsonEncode(payload)) then
+                MX.activePrepareId=nil
+                isServerActive=false
+                sysMsg("❌ Could not announce the server song preparation to Firebase.", RED)
+                return
+            end
+            sysMsg("⏳ Preparing "..e.name.." for online RX Chat clients…", BLUE)
+            task.spawn(function() pcall(MX.prepareSynced, e.hash, e.name, sessionId) end)
+            task.spawn(function()
+                local deadline = os.clock() + MUSIC_READY_TIMEOUT_MS/1000
+                local allReady, missingCount, totalCount = false, nil, nil
+                while alive and MX.activePrepareId==sessionId and os.clock()<deadline do
+                    allReady, missingCount, totalCount = readinessStatus(sessionId, e.hash)
+                    if allReady then break end
+                    task.wait(0.5)
+                end
+                if not alive or MX.activePrepareId~=sessionId then return end
+                if allReady then
+                    sysMsg("✅ All "..tostring(totalCount or 0).." live client(s) downloaded the song.", Color3.fromRGB(0,255,150))
+                else
+                    sysMsg("⚠ Timed out waiting for "..tostring(missingCount or "some").." client(s); starting anyway.", Color3.fromRGB(255,200,100))
+                end
+                local playPayload = {}
+                for k, v in pairs(payload) do playPayload[k]=v end
+                local startAt = sharedMusicClockMs() + MUSIC_SYNC_START_LEAD_MS
+                playPayload.action="play"
+                playPayload.musicAction="play"
+                playPayload.timestamp=os.time()*1000
+                playPayload.startAt=startAt
+                local playBody = jsonEncode(playPayload)
+                local published = nil
+                for _=1,3 do
+                    published = httpPut(MUSIC_PRESENCE_URL, playBody)
+                    if published then break end
+                    task.wait(0.5)
+                end
+                if not published then
+                    MX.activePrepareId=nil
+                    isServerActive=false
+                    sysMsg("❌ Could not publish the synchronized start to Firebase.", RED)
+                    return
+                end
+                MX.activePrepareId=nil
+                lastMusicTs=tonumber(playPayload.timestamp) or lastMusicTs
+                if addChatMessage then addChatMessage(player.DisplayName, msg, true, myRole, player.UserId, nil, nil, nil, nil, player.Name) end
+                task.spawn(function() pcall(function() httpPost(FIREBASE_URL, jsonEncode(playPayload)) end) end)
+                pcall(MX.playSynced, e.hash, e.name, "server", nil, nil, startAt)
+                task.delay(3, function()
+                    pcall(function() httpDelete(MUSIC_READY_ROOT.."/"..sessionId..".json") end)
+                end)
+            end)
         end
 
         local uploadBusy = false
@@ -2413,6 +2539,9 @@ local function buildUI()
                     if addSystemMessage then addSystemMessage("Enter Asset ID", Color3.fromRGB(255,100,100)) end
                     return
                 end
+                local cancelledPrepare = MX.activePrepareId
+                MX.activePrepareId=nil
+                if cancelledPrepare then task.spawn(function() pcall(function() httpDelete(MUSIC_READY_ROOT.."/"..safeMusicSessionId(cancelledPrepare)..".json") end) end) end
                 stopAllMusicSafe(true)
                 isServerActive=true
                 lastMusicTs=os.time()*1000
@@ -2429,9 +2558,12 @@ local function buildUI()
             pcall(function()
                 if myRole=="none" then return end
                 lastMusicTs=os.time()*1000
+                local cancelledPrepare = MX.activePrepareId
+                MX.activePrepareId=nil
                 local stopPayload = {assetId="", musicAssetId="", action="stop", musicAction="stop", by=player.DisplayName, byUserId=player.UserId, role=myRole, timestamp=lastMusicTs, isMusic=true, sessionOnly=true, name=player.Name, displayName=player.DisplayName, id=generateGUID(), message="🔇 SERVER MUSIC STOP [SESSION]"}
                 task.spawn(function() pcall(function() httpPut(MUSIC_PRESENCE_URL, jsonEncode(stopPayload)) end) end)
                 task.spawn(function() pcall(function() httpPost(FIREBASE_URL, jsonEncode(stopPayload)) end) end)
+                if cancelledPrepare then task.spawn(function() pcall(function() httpDelete(MUSIC_READY_ROOT.."/"..safeMusicSessionId(cancelledPrepare)..".json") end) end) end
                 stopAllMusicSafe(true)
                 isServerActive=false
                 if addSystemMessage then addSystemMessage("🔇 Server stopped [SESSION]", Color3.fromRGB(255,200,100)) end
@@ -2476,8 +2608,26 @@ local function buildUI()
                         if firstPresenceSnapshot or signature~=lastMusicPresenceSignature or (ts~=0 and ts>lastMusicTs) then
                             musicPresenceInitialized = true
                             lastMusicPresenceSignature = signature
-                            if tonumber(data.byUserId)~=player.UserId then
+                            if action=="prepare" and data.musicType=="file" and tostring(data.musicHash or ""):match("^%x+_%d+$") then
+                                local prepId = safeMusicSessionId(data.sessionId or data.id)
+                                if prepId~="" then
+                                    if ts~=0 then lastMusicTs=math.max(lastMusicTs,ts) end
+                                    stopAllMusicSafe(true)
+                                    MX.activePrepareId=prepId
+                                    isServerActive=true
+                                    local prepHash, prepName = tostring(data.musicHash), data.musicName
+                                    task.spawn(function() pcall(MX.prepareSynced, prepHash, prepName, prepId) end)
+                                    task.delay(MUSIC_READY_TIMEOUT_MS/1000+10, function()
+                                        if MX.activePrepareId==prepId then
+                                            MX.activePrepareId=nil
+                                            if not currentSound then isServerActive=false end
+                                            if addSystemMessage then addSystemMessage("⏱ Server song preparation expired.", Color3.fromRGB(255,200,100)) end
+                                        end
+                                    end)
+                                end
+                            elseif tonumber(data.byUserId)~=player.UserId then
                                 if action=="stop" or assetId=="" then
+                                    MX.activePrepareId=nil
                                     if currentSound or isServerActive then stopAllMusicSafe(true) end
                                     isServerActive=false
                                     if ts~=0 then lastMusicTs=math.max(lastMusicTs,ts) end
@@ -2485,6 +2635,7 @@ local function buildUI()
                                         addSystemMessage("🔇 Server stopped by "..(data.by or "STAFF"), Color3.fromRGB(255,200,100))
                                     end
                                 elseif action=="play" and assetId~="" then
+                                    MX.activePrepareId=nil
                                     if ts~=0 then lastMusicTs=math.max(lastMusicTs,ts) end
                                     stopAllMusicSafe(true)
                                     isServerActive=true
@@ -2499,6 +2650,7 @@ local function buildUI()
                                     end
                                 end
                             else
+                                if action=="play" then MX.activePrepareId=nil end
                                 if ts~=0 then lastMusicTs=math.max(lastMusicTs,ts) end
                             end
                         end
@@ -3524,8 +3676,7 @@ local function buildUI()
         FX.bubbleStyle(bubble, isPrivateMsg)
 
         local bubblePadding = Instance.new("UIPadding")
-        bubblePadding.PaddingTop=UDim.new(0,2) bubblePadding.PaddingBottom=UDim.new(0,4)
-        bubblePadding.PaddingLeft=UDim.new(0,5) bubblePadding.PaddingRight=UDim.new(0,5)
+        bubblePadding.PaddingTop=UDim.new(0,2) bubblePadding.PaddingBottom=UDim.new(0,3)
         bubblePadding.Parent=bubble
         local bubbleLayout = Instance.new("UIListLayout")
         bubbleLayout.FillDirection=Enum.FillDirection.Vertical
@@ -3539,7 +3690,6 @@ local function buildUI()
 
         local nameLbl = Instance.new("TextLabel")
         nameLbl.Size=UDim2.new(1,0,0,16) nameLbl.BackgroundTransparency=1
-        nameLbl.TextWrapped=true nameLbl.AutomaticSize=Enum.AutomaticSize.Y
         nameLbl.Text=tag..chatName..privateTag..":"
         nameLbl.TextColor3=roleColor nameLbl.TextXAlignment=Enum.TextXAlignment.Left
         nameLbl.TextSize=11 nameLbl.Font=Enum.Font.GothamBold
@@ -3549,7 +3699,7 @@ local function buildUI()
             local isSelfReply = (replyData.sender==displaySender) or (replyData.sender==sender) or (replyData.sender==getNick(userId, sender))
             local rFrame = Instance.new("Frame")
             rFrame.Size=UDim2.new(1,0,0,32) rFrame.BackgroundColor3=Color3.fromRGB(30,30,38)
-            rFrame.BorderSizePixel=0 rFrame.ClipsDescendants=true rFrame.LayoutOrder=2 rFrame.Parent=bubble
+            rFrame.BorderSizePixel=0 rFrame.LayoutOrder=2 rFrame.Parent=bubble
             local rCorner = Instance.new("UICorner")
             rCorner.CornerRadius=UDim.new(0,4) rCorner.Parent=rFrame
             local rBar = Instance.new("Frame")
@@ -3685,7 +3835,7 @@ local function buildUI()
             end
             msgLbl.Text=displayText msgLbl.TextXAlignment=Enum.TextXAlignment.Left
             msgLbl.TextYAlignment=Enum.TextYAlignment.Top
-            msgLbl.TextWrapped=true msgLbl.RichText=false msgLbl.ClipsDescendants=true
+            msgLbl.TextWrapped=true msgLbl.RichText=false
             msgLbl.TextSize=12 msgLbl.Font=Enum.Font.Gotham
             msgLbl.LayoutOrder=3 msgLbl.Parent=bubble
         end
