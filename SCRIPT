@@ -1494,6 +1494,14 @@ local function buildUI()
     local currentSound, currentMusicType, lastMusicTs, isServerActive
     currentSound=nil currentMusicType=nil lastMusicTs=SESSION_STARTED_AT isServerActive=false
     local MUSIC_PRESENCE_URL = PRESENCE_ROOT.."/music.json"
+    local MUSIC_SYNC_START_LEAD_MS = 5000
+    local function sharedMusicClockMs()
+        local ok, value = pcall(function() return workspace:GetServerTimeNow() end)
+        if ok and tonumber(value) then return tonumber(value)*1000 end
+        local dateOk, dateValue = pcall(function() return DateTime.now().UnixTimestampMillis end)
+        if dateOk and tonumber(dateValue) then return tonumber(dateValue) end
+        return os.time()*1000
+    end
 
     local stopAllMusicSafe
     local playMusicSafe
@@ -1516,8 +1524,10 @@ local function buildUI()
         end)
     end
 
-    playMusicSafe = function(assetId, mType, rawSoundId)
+    playMusicSafe = function(assetId, mType, rawSoundId, startAtMs)
         local clean = tostring(assetId):gsub("%D","")
+        local scheduledStartMs = tonumber(startAtMs)
+        if scheduledStartMs and scheduledStartMs < 1000000000000 then scheduledStartMs=nil end
         if not rawSoundId and (clean=="" or clean=="0") then
             if addSystemMessage then addSystemMessage("Invalid asset ID", Color3.fromRGB(255,100,100)) end
             return nil
@@ -1535,7 +1545,7 @@ local function buildUI()
             s.Volume=1
             s.Looped=false
             s.Parent=workspace
-            s:Play()
+            if not scheduledStartMs then s:Play() end
         end)
         if not ok or not s then
             if s then pcall(function() s:Destroy() end) end
@@ -1554,6 +1564,53 @@ local function buildUI()
                 end
             end)
         end)
+        if scheduledStartMs then
+            local playbackToken = MX.token
+            local function seekToSharedPosition()
+                if not (s.IsLoaded and s.TimeLength>0) then return true end
+                local elapsed = math.max(0, (sharedMusicClockMs()-scheduledStartMs)/1000)
+                if elapsed >= s.TimeLength then
+                    if currentSound==s then
+                        currentSound=nil currentMusicType=nil
+                        if mType=="server" then isServerActive=false end
+                    end
+                    pcall(function() s:Stop() s:Destroy() end)
+                    return false
+                end
+                if elapsed > 0.05 then pcall(function() s.TimePosition=elapsed end) end
+                return true
+            end
+            task.spawn(function()
+                while currentSound==s and MX.token==playbackToken and s.Parent do
+                    local remaining=(scheduledStartMs-sharedMusicClockMs())/1000
+                    if remaining<=0 then break end
+                    task.wait(math.min(remaining,0.1))
+                end
+                if currentSound~=s or MX.token~=playbackToken or not s.Parent then return end
+                local started, startErr = pcall(function()
+                    if not seekToSharedPosition() then return end
+                    s:Play()
+                end)
+                if not started then
+                    if currentSound==s then
+                        currentSound=nil currentMusicType=nil
+                        if mType=="server" then isServerActive=false end
+                    end
+                    pcall(function() s:Destroy() end)
+                    warn("[RX Music] scheduled playback failed: "..tostring(startErr))
+                    return
+                end
+                task.spawn(function()
+                    local waited=0
+                    while currentSound==s and MX.token==playbackToken and s.Parent and not s.IsLoaded and waited<20 do
+                        task.wait(0.1) waited=waited+0.1
+                    end
+                    if currentSound==s and MX.token==playbackToken and s.Parent and s.IsLoaded then
+                        pcall(seekToSharedPosition)
+                    end
+                end)
+            end)
+        end
         return s
     end
 
@@ -1840,11 +1897,12 @@ local function buildUI()
             return resultPath
         end
 
-        -- plays a song from rx_music. t0 = os.clock() when the play command arrived (receivers seek forward by
-        -- the time spent downloading so everybody ends up on the same position)
-        MX.playSynced = function(hash, name, mType, byName, t0)
+        -- Plays rx_music tracks at the broadcast's shared server-time start; t0 remains the legacy fallback.
+        MX.playSynced = function(hash, name, mType, byName, t0, startAtMs)
             local myToken = MX.token
             local label = tostring(name or "SONG")
+            local sharedStartMs = tonumber(startAtMs)
+            if sharedStartMs and sharedStartMs < 1000000000000 then sharedStartMs=nil end
             local path = findLocal(hash)
             if path then path = normalizeLocalSongName(path, hash) end
             if not path then
@@ -1860,7 +1918,7 @@ local function buildUI()
                 return
             end
             if MX.token ~= myToken then return end
-            local s = playMusicSafe(hash, mType, asset)
+            local s = playMusicSafe(hash, mType, asset, sharedStartMs)
             if not s then
                 if mType=="server" then isServerActive = false end
                 return
@@ -1870,7 +1928,7 @@ local function buildUI()
             else
                 sysMsg("▶ Client: "..label, Color3.fromRGB(100,255,100))
             end
-            if t0 then
+            if t0 and not sharedStartMs then
                 task.spawn(function()
                     local waited = 0
                     while s.Parent and not s.IsLoaded and waited < 8 do task.wait(0.1) waited = waited + 0.1 end
@@ -1953,16 +2011,17 @@ local function buildUI()
             stopAllMusicSafe(true)
             isServerActive = true
             lastMusicTs = os.time()*1000
+            local startAt = sharedMusicClockMs() + MUSIC_SYNC_START_LEAD_MS
             local msg = "🔊 SERVER MUSIC: "..e.name.." [SESSION]"
             -- assetId "0" keeps older script versions harmless; new versions read musicType/musicHash
             local payload = {assetId="0", musicAssetId="0", musicType="file", musicHash=e.hash, musicName=e.name,
                 action="play", musicAction="play", by=player.DisplayName, byUserId=player.UserId, role=myRole,
-                timestamp=lastMusicTs, isMusic=true, sessionOnly=true, name=player.Name, displayName=player.DisplayName,
+                timestamp=lastMusicTs, startAt=startAt, isMusic=true, sessionOnly=true, name=player.Name, displayName=player.DisplayName,
                 id=generateGUID(), message=msg}
             if addChatMessage then addChatMessage(player.DisplayName, msg, true, myRole, player.UserId, nil, nil, nil, nil, player.Name) end
             task.spawn(function() pcall(function() httpPut(MUSIC_PRESENCE_URL, jsonEncode(payload)) end) end)
             task.spawn(function() pcall(function() httpPost(FIREBASE_URL, jsonEncode(payload)) end) end)
-            MX.playSynced(e.hash, e.name, "server", nil, nil)
+            MX.playSynced(e.hash, e.name, "server", nil, nil, startAt)
         end
 
         local uploadBusy = false
@@ -2355,11 +2414,12 @@ local function buildUI()
                 stopAllMusicSafe(true)
                 isServerActive=true
                 lastMusicTs=os.time()*1000
-                local payload = {assetId=id, musicAssetId=id, action="play", musicAction="play", by=player.DisplayName, byUserId=player.UserId, role=myRole, timestamp=lastMusicTs, isMusic=true, sessionOnly=true, name=player.Name, displayName=player.DisplayName, id=generateGUID(), message="🔊 SERVER MUSIC: "..id.." [SESSION]"}
+                local startAt = sharedMusicClockMs() + MUSIC_SYNC_START_LEAD_MS
+                local payload = {assetId=id, musicAssetId=id, action="play", musicAction="play", by=player.DisplayName, byUserId=player.UserId, role=myRole, timestamp=lastMusicTs, startAt=startAt, isMusic=true, sessionOnly=true, name=player.Name, displayName=player.DisplayName, id=generateGUID(), message="🔊 SERVER MUSIC: "..id.." [SESSION]"}
                 if addChatMessage then addChatMessage(player.DisplayName, payload.message, true, myRole, player.UserId, nil, nil, nil, nil, player.Name) end
                 task.spawn(function() pcall(function() httpPut(MUSIC_PRESENCE_URL, jsonEncode(payload)) end) end)
                 task.spawn(function() pcall(function() httpPost(FIREBASE_URL, jsonEncode(payload)) end) end)
-                playMusicSafe(id,"server")
+                playMusicSafe(id,"server",nil,startAt)
                 if addSystemMessage then addSystemMessage("🔊 SERVER ALL: "..id.." BY "..string.upper(player.DisplayName), Color3.fromRGB(0,255,150)) end
             end)
         end)
@@ -2405,9 +2465,10 @@ local function buildUI()
                         local ts = tonumber(data.timestamp) or 0
                         local action = data.musicAction or data.action or "play"
                         local assetId = data.musicAssetId or data.assetId or ""
+                        local startAtMs = tonumber(data.startAt)
                         local signature = table.concat({
                             tostring(data.id or ""), tostring(ts), tostring(action), tostring(assetId),
-                            tostring(data.musicHash or "")
+                            tostring(data.musicHash or ""), tostring(data.startAt or "")
                         }, "|")
                         local firstPresenceSnapshot = not musicPresenceInitialized
                         if firstPresenceSnapshot or signature~=lastMusicPresenceSignature or (ts~=0 and ts>lastMusicTs) then
@@ -2429,9 +2490,9 @@ local function buildUI()
                                         local recvAt = os.clock()
                                         local fHash, fName, fBy = tostring(data.musicHash), data.musicName, data.by or "STAFF"
                                         if addSystemMessage then addSystemMessage("📥 Song from "..tostring(fBy)..": "..tostring(fName), Color3.fromRGB(150,200,255)) end
-                                        task.spawn(function() pcall(MX.playSynced, fHash, fName, "server", fBy, recvAt) end)
+                                        task.spawn(function() pcall(MX.playSynced, fHash, fName, "server", fBy, recvAt, startAtMs) end)
                                     else
-                                        playMusicSafe(assetId,"server")
+                                        playMusicSafe(assetId,"server",nil,startAtMs)
                                         if addSystemMessage then addSystemMessage("🔊 SERVER: "..tostring(assetId):gsub("%D","").." BY "..string.upper(data.by or "STAFF"), Color3.fromRGB(0,255,150)) end
                                     end
                                 end
