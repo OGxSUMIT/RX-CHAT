@@ -2387,6 +2387,8 @@ local function buildUI()
 
     local musicFetchInProgress = false
     local lastMusicFetch = 0
+    local musicPresenceInitialized = false
+    local lastMusicPresenceSignature = nil
     task.spawn(function()
         while alive do
             task.wait(MUSIC_POLL_INTERVAL)
@@ -2401,17 +2403,26 @@ local function buildUI()
                     local data = jsonDecode(resp)
                     if type(data)=="table" and (data.assetId or data.musicAssetId) then
                         local ts = tonumber(data.timestamp) or 0
-                        if ts==0 or ts>lastMusicTs or lastMusicTs==0 then
-                            local action = data.musicAction or data.action or "play"
-                            local assetId = data.musicAssetId or data.assetId or ""
+                        local action = data.musicAction or data.action or "play"
+                        local assetId = data.musicAssetId or data.assetId or ""
+                        local signature = table.concat({
+                            tostring(data.id or ""), tostring(ts), tostring(action), tostring(assetId),
+                            tostring(data.musicHash or "")
+                        }, "|")
+                        local firstPresenceSnapshot = not musicPresenceInitialized
+                        if firstPresenceSnapshot or signature~=lastMusicPresenceSignature or (ts~=0 and ts>lastMusicTs) then
+                            musicPresenceInitialized = true
+                            lastMusicPresenceSignature = signature
                             if tonumber(data.byUserId)~=player.UserId then
                                 if action=="stop" or assetId=="" then
                                     if currentSound or isServerActive then stopAllMusicSafe(true) end
                                     isServerActive=false
-                                    if ts~=0 then lastMusicTs=ts end
-                                    if addSystemMessage then addSystemMessage("🔇 Server stopped by "..(data.by or "STAFF"), Color3.fromRGB(255,200,100)) end
+                                    if ts~=0 then lastMusicTs=math.max(lastMusicTs,ts) end
+                                    if not firstPresenceSnapshot and addSystemMessage then
+                                        addSystemMessage("🔇 Server stopped by "..(data.by or "STAFF"), Color3.fromRGB(255,200,100))
+                                    end
                                 elseif action=="play" and assetId~="" then
-                                    lastMusicTs=ts
+                                    if ts~=0 then lastMusicTs=math.max(lastMusicTs,ts) end
                                     stopAllMusicSafe(true)
                                     isServerActive=true
                                     if data.musicType=="file" and tostring(data.musicHash or ""):match("^%x+_%d+$") then
@@ -2425,7 +2436,7 @@ local function buildUI()
                                     end
                                 end
                             else
-                                if ts~=0 then lastMusicTs=ts end
+                                if ts~=0 then lastMusicTs=math.max(lastMusicTs,ts) end
                             end
                         end
                     end
