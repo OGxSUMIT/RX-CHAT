@@ -1221,7 +1221,9 @@ local function buildUI()
     inputBox.PlaceholderText="Type a message..."
     inputBox.PlaceholderColor3=Color3.fromRGB(150,150,160)
     inputBox.Font=Enum.Font.Gotham inputBox.TextSize=13
-    inputBox.ClearTextOnFocus=false inputBox.TextWrapped=true
+    inputBox.ClearTextOnFocus=false inputBox.TextWrapped=false
+    inputBox.ClipsDescendants=true inputBox.TextTruncate=Enum.TextTruncate.None
+    inputBox.TextYAlignment=Enum.TextYAlignment.Center
     inputBox.TextXAlignment=Enum.TextXAlignment.Left inputBox.Parent=chatPanel
 
     local musicBtn = Instance.new("TextButton")
@@ -3522,7 +3524,8 @@ local function buildUI()
         FX.bubbleStyle(bubble, isPrivateMsg)
 
         local bubblePadding = Instance.new("UIPadding")
-        bubblePadding.PaddingTop=UDim.new(0,2) bubblePadding.PaddingBottom=UDim.new(0,3)
+        bubblePadding.PaddingTop=UDim.new(0,2) bubblePadding.PaddingBottom=UDim.new(0,4)
+        bubblePadding.PaddingLeft=UDim.new(0,5) bubblePadding.PaddingRight=UDim.new(0,5)
         bubblePadding.Parent=bubble
         local bubbleLayout = Instance.new("UIListLayout")
         bubbleLayout.FillDirection=Enum.FillDirection.Vertical
@@ -3536,6 +3539,7 @@ local function buildUI()
 
         local nameLbl = Instance.new("TextLabel")
         nameLbl.Size=UDim2.new(1,0,0,16) nameLbl.BackgroundTransparency=1
+        nameLbl.TextWrapped=true nameLbl.AutomaticSize=Enum.AutomaticSize.Y
         nameLbl.Text=tag..chatName..privateTag..":"
         nameLbl.TextColor3=roleColor nameLbl.TextXAlignment=Enum.TextXAlignment.Left
         nameLbl.TextSize=11 nameLbl.Font=Enum.Font.GothamBold
@@ -3545,7 +3549,7 @@ local function buildUI()
             local isSelfReply = (replyData.sender==displaySender) or (replyData.sender==sender) or (replyData.sender==getNick(userId, sender))
             local rFrame = Instance.new("Frame")
             rFrame.Size=UDim2.new(1,0,0,32) rFrame.BackgroundColor3=Color3.fromRGB(30,30,38)
-            rFrame.BorderSizePixel=0 rFrame.LayoutOrder=2 rFrame.Parent=bubble
+            rFrame.BorderSizePixel=0 rFrame.ClipsDescendants=true rFrame.LayoutOrder=2 rFrame.Parent=bubble
             local rCorner = Instance.new("UICorner")
             rCorner.CornerRadius=UDim.new(0,4) rCorner.Parent=rFrame
             local rBar = Instance.new("Frame")
@@ -3681,7 +3685,7 @@ local function buildUI()
             end
             msgLbl.Text=displayText msgLbl.TextXAlignment=Enum.TextXAlignment.Left
             msgLbl.TextYAlignment=Enum.TextYAlignment.Top
-            msgLbl.TextWrapped=true msgLbl.RichText=false
+            msgLbl.TextWrapped=true msgLbl.RichText=false msgLbl.ClipsDescendants=true
             msgLbl.TextSize=12 msgLbl.Font=Enum.Font.Gotham
             msgLbl.LayoutOrder=3 msgLbl.Parent=bubble
         end
