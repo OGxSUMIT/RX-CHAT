@@ -1571,7 +1571,9 @@ local function buildUI()
         end)
         if scheduledStartMs then
             local playbackToken = MX.token
+            local preserveTrackStart = rawSoundId ~= nil -- RX Music MP3s must begin at 0 even if a client receives the event late.
             local function seekToSharedPosition()
+                if preserveTrackStart then return true end
                 if not (s.IsLoaded and s.TimeLength>0) then return true end
                 local elapsed = math.max(0, (sharedMusicClockMs()-scheduledStartMs)/1000)
                 if elapsed >= s.TimeLength then
@@ -1933,7 +1935,7 @@ local function buildUI()
             else
                 sysMsg("▶ Client: "..label, Color3.fromRGB(100,255,100))
             end
-            if t0 and not sharedStartMs then
+            if t0 and not sharedStartMs and mType~="server" then
                 task.spawn(function()
                     local waited = 0
                     while s.Parent and not s.IsLoaded and waited < 8 do task.wait(0.1) waited = waited + 0.1 end
