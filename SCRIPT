@@ -1496,7 +1496,7 @@ local function buildUI()
     local MUSIC_PRESENCE_URL = PRESENCE_ROOT.."/music.json"
     local MUSIC_READY_ROOT = PRESENCE_ROOT.."/musicReady"
     local MUSIC_SYNC_START_LEAD_MS = 5000
-    local MUSIC_READY_TIMEOUT_MS = 300000
+    local MUSIC_READY_TIMEOUT_MS = 60000
     local function safeMusicSessionId(value)
         return tostring(value or ""):gsub("[^%w_%-]", "")
     end
