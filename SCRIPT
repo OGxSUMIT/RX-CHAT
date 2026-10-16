@@ -1529,7 +1529,7 @@ local function buildUI()
         end)
     end
 
-    playMusicSafe = function(assetId, mType, rawSoundId, startAtMs)
+    playMusicSafe = function(assetId, mType, rawSoundId, startAtMs, resumeLateJoin)
         local clean = tostring(assetId):gsub("%D","")
         local scheduledStartMs = tonumber(startAtMs)
         if scheduledStartMs and scheduledStartMs < 1000000000000 then scheduledStartMs=nil end
@@ -1571,7 +1571,7 @@ local function buildUI()
         end)
         if scheduledStartMs then
             local playbackToken = MX.token
-            local preserveTrackStart = rawSoundId ~= nil -- RX Music MP3s must begin at 0 even if a client receives the event late.
+            local preserveTrackStart = rawSoundId ~= nil and resumeLateJoin ~= true -- Normal MP3 broadcasts begin at 0; late joiners resume the current position.
             local function seekToSharedPosition()
                 if preserveTrackStart then return true end
                 if not (s.IsLoaded and s.TimeLength>0) then return true end
@@ -1594,6 +1594,13 @@ local function buildUI()
                     task.wait(math.min(remaining,0.1))
                 end
                 if currentSound~=s or MX.token~=playbackToken or not s.Parent then return end
+                if resumeLateJoin then
+                    local waitedForLoad=0
+                    while currentSound==s and MX.token==playbackToken and s.Parent and not s.IsLoaded and waitedForLoad<20 do
+                        task.wait(0.1) waitedForLoad=waitedForLoad+0.1
+                    end
+                    if currentSound~=s or MX.token~=playbackToken or not s.Parent then return end
+                end
                 local started, startErr = pcall(function()
                     if not seekToSharedPosition() then return end
                     s:Play()
@@ -1905,7 +1912,7 @@ local function buildUI()
         end
 
         -- Plays rx_music tracks at the broadcast's shared server-time start; t0 remains the legacy fallback.
-        MX.playSynced = function(hash, name, mType, byName, t0, startAtMs)
+        MX.playSynced = function(hash, name, mType, byName, t0, startAtMs, resumeLateJoin)
             local myToken = MX.token
             local label = tostring(name or "SONG")
             local sharedStartMs = tonumber(startAtMs)
@@ -1925,7 +1932,7 @@ local function buildUI()
                 return
             end
             if MX.token ~= myToken then return end
-            local s = playMusicSafe(hash, mType, asset, sharedStartMs)
+            local s = playMusicSafe(hash, mType, asset, sharedStartMs, resumeLateJoin)
             if not s then
                 if mType=="server" then isServerActive = false end
                 return
@@ -2644,8 +2651,11 @@ local function buildUI()
                                     if data.musicType=="file" and tostring(data.musicHash or ""):match("^%x+_%d+$") then
                                         local recvAt = os.clock()
                                         local fHash, fName, fBy = tostring(data.musicHash), data.musicName, data.by or "STAFF"
+                                        local playbackStartMs = tonumber(startAtMs)
+                                        if (not playbackStartMs or playbackStartMs<1000000000000) and firstPresenceSnapshot then playbackStartMs=ts end
+                                        local resumeLateJoin = firstPresenceSnapshot and playbackStartMs and playbackStartMs<sharedMusicClockMs()-500 or false
                                         if addSystemMessage then addSystemMessage("📥 Song from "..tostring(fBy)..": "..tostring(fName), Color3.fromRGB(150,200,255)) end
-                                        task.spawn(function() pcall(MX.playSynced, fHash, fName, "server", fBy, recvAt, startAtMs) end)
+                                        task.spawn(function() pcall(MX.playSynced, fHash, fName, "server", fBy, recvAt, playbackStartMs, resumeLateJoin==true) end)
                                     else
                                         playMusicSafe(assetId,"server",nil,startAtMs)
                                         if addSystemMessage then addSystemMessage("🔊 SERVER: "..tostring(assetId):gsub("%D","").." BY "..string.upper(data.by or "STAFF"), Color3.fromRGB(0,255,150)) end
