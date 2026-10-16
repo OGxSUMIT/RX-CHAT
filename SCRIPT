@@ -1635,6 +1635,7 @@ local function buildUI()
     do
         local RED = Color3.fromRGB(255,100,100)
         local BLUE = Color3.fromRGB(150,200,255)
+        local legacyHashCache = {}
         local function sysMsg(t, c) if addSystemMessage then addSystemMessage(t, c) end end
         local function chunkKey(i) return string.format("c%04d", i) end
 
@@ -1670,12 +1671,21 @@ local function buildUI()
             if not readfile then return nil end
             local ok, data = pcall(readfile, path)
             if not ok then return nil end
-            return hashData(data)
+            local fullHash = hashData(data)
+            legacyHashCache[path] = legacyHashData(data)
+            return fullHash
         end
         local function fileMatchesHash(path, targetHash)
             if not readfile then return false end
+            if MX.hashCache[path]==targetHash or legacyHashCache[path]==targetHash then return true end
+            if MX.hashCache[path]~=nil and legacyHashCache[path]~=nil then return false end
             local ok, data = pcall(readfile, path)
-            return ok and (hashData(data)==targetHash or legacyHashData(data)==targetHash)
+            if not ok then return false end
+            local fullHash = hashData(data)
+            local legacyHash = legacyHashData(data)
+            MX.hashCache[path] = fullHash
+            legacyHashCache[path] = legacyHash
+            return fullHash==targetHash or legacyHash==targetHash
         end
         local function localFileExists(path)
             if isfile then
@@ -1722,7 +1732,7 @@ local function buildUI()
             if localFileExists(target) and fileMatchesHash(target, hash) then
                 if delfile then pcall(delfile, path) end
                 MX.hashCache[path] = nil
-                MX.hashCache[target] = hash
+                legacyHashCache[path] = nil
                 return target
             end
             local readOk, data = pcall(readfile, path)
@@ -1731,7 +1741,7 @@ local function buildUI()
             if not writeOk or not fileMatchesHash(target, hash) then return path end
             if delfile then pcall(delfile, path) end
             MX.hashCache[path] = nil
-            MX.hashCache[target] = hash
+            legacyHashCache[path] = nil
             return target
         end
 
@@ -1742,8 +1752,13 @@ local function buildUI()
             for _,f in ipairs(files) do
                 if tostring(f):lower():match("%.mp3$") then
                     local h = MX.hashCache[f]
-                    if not h then h = hashFile(f) MX.hashCache[f] = h end
-                    if h == hash or fileMatchesHash(f, hash) then return f end
+                    local oldHash = legacyHashCache[f]
+                    if not h or not oldHash then
+                        h = hashFile(f)
+                        MX.hashCache[f] = h
+                        oldHash = legacyHashCache[f]
+                    end
+                    if h == hash or oldHash == hash then return f end
                 end
             end
             return nil
@@ -1761,7 +1776,7 @@ local function buildUI()
             for _,f in ipairs(files) do
                 if tostring(f):lower():match("%.mp3$") then
                     local h = MX.hashCache[f]
-                    if not h then h = hashFile(f) MX.hashCache[f] = h task.wait() end
+                    if not h or not legacyHashCache[f] then h = hashFile(f) MX.hashCache[f] = h task.wait() end
                     if h then
                         groups[h] = groups[h] or {}
                         table.insert(groups[h], f)
@@ -1786,6 +1801,7 @@ local function buildUI()
                             if dataOk and candidateData==keepData and pcall(delfile, scored[i].path) then
                                 removed = removed + 1
                                 MX.hashCache[scored[i].path] = nil
+                                legacyHashCache[scored[i].path] = nil
                             end
                         end
                     end
@@ -1893,14 +1909,17 @@ local function buildUI()
                 end
                 local data = table.concat(parts)
                 if declaredSize and #data~=declaredSize then MX.lastError = "downloaded size does not match metadata" return end
-                if hashData(data)~=hash and legacyHashData(data)~=hash then
+                local actualHash = hashData(data)
+                local actualLegacyHash = legacyHashData(data)
+                if actualHash~=hash and actualLegacyHash~=hash then
                     MX.lastError = "downloaded file is damaged (hash mismatch)"
                     return
                 end
                 ensureFolder(MX.folder)
                 local path = localSongPath(meta, hash)
                 if writefile and pcall(writefile, path, data) then
-                    MX.hashCache[path] = hash
+                    MX.hashCache[path] = actualHash
+                    legacyHashCache[path] = actualLegacyHash
                     resultPath = path
                 else
                     MX.lastError = "writefile failed (executor can't save files)"
@@ -1912,12 +1931,13 @@ local function buildUI()
         end
 
         -- Plays rx_music tracks at the broadcast's shared server-time start; t0 remains the legacy fallback.
-        MX.playSynced = function(hash, name, mType, byName, t0, startAtMs, resumeLateJoin)
+        MX.playSynced = function(hash, name, mType, byName, t0, startAtMs, resumeLateJoin, localPathHint)
             local myToken = MX.token
             local label = tostring(name or "SONG")
             local sharedStartMs = tonumber(startAtMs)
             if sharedStartMs and sharedStartMs < 1000000000000 then sharedStartMs=nil end
-            local path = findLocal(hash)
+            local path = type(localPathHint)=="string" and localPathHint~="" and localFileExists(localPathHint) and localPathHint or nil
+            if not path then path = findLocal(hash) end
             if path then path = normalizeLocalSongName(path, hash) end
             if not path then
                 sysMsg("⬇ Loading song: "..label.."…", BLUE)
@@ -1989,7 +2009,7 @@ local function buildUI()
                     for _,f in ipairs(files) do
                         if tostring(f):lower():match("%.mp3$") then
                             local h = MX.hashCache[f]
-                            if not h then h = hashFile(f) MX.hashCache[f] = h task.wait() end
+                            if not h or not legacyHashCache[f] then h = hashFile(f) MX.hashCache[f] = h task.wait() end
                             if h and not byHash[h] then
                                 local fname = tostring(f):match("([^/\\]+)$") or "SONG"
                                 local e = {hash=h, name=(fname:gsub("%.[^.]+$","")), localPath=f}
@@ -2222,16 +2242,29 @@ local function buildUI()
                 pb.BackgroundColor3=(mode=="server") and FX.T.GOLD_2 or FX.T.OK pb.TextColor3=FX.T.BG
                 pb.Font=Enum.Font.GothamBold pb.TextSize=11 pb.ZIndex=203 pb.Parent=row
                 FX.corner(pb, 8) FX.press(pb)
+                local clientPlayBusy = false
                 pb.MouseButton1Click:Connect(function()
                     if mode=="server" then
                         task.spawn(function() pcall(broadcastSong, e) end)
                     else
                         if isServerActive then sysMsg("🔇 Server active! Stop server first.", RED) return end
+                        if clientPlayBusy then return end
+                        clientPlayBusy = true
+                        pb.Text="Loading…"
+                        pb.Active=false
+                        pb.AutoButtonColor=false
                         task.spawn(function()
-                            pcall(function()
+                            local ok, err = pcall(function()
                                 stopAllMusicSafe(false)
-                                MX.playSynced(e.hash, e.name, "client", nil, nil)
+                                MX.playSynced(e.hash, e.name, "client", nil, nil, nil, false, e.localPath)
                             end)
+                            if not ok then warn("[RX Music] client playback failed: "..tostring(err)) end
+                            clientPlayBusy = false
+                            if pb.Parent then
+                                pb.Text="▶ Play"
+                                pb.Active=true
+                                pb.AutoButtonColor=true
+                            end
                         end)
                     end
                 end)
@@ -2274,6 +2307,7 @@ local function buildUI()
                     if isfile then verifyOk, stillExists = pcall(isfile, path) end
                     if deleteOk and deleteResult~=false and verifyOk and not stillExists then
                         MX.hashCache[path] = nil
+                        legacyHashCache[path] = nil
                         e.localPath = nil
                         sysMsg("Deleted local MP3: "..tostring(e.name).." (Firebase copy unchanged)", Color3.fromRGB(100,255,100))
                         if MX.refresh then MX.refresh() end
