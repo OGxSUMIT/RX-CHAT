@@ -1529,6 +1529,27 @@ local function buildUI()
         end)
     end
 
+    local serverMessagePending = setmetatable({}, {__mode="k"})
+    local function reportServerPlaybackWhenActive(sound, message)
+        if not sound or serverMessagePending[sound] then return end
+        serverMessagePending[sound] = true
+        task.spawn(function()
+            local deadline = os.clock() + 20
+            while currentSound==sound and currentMusicType=="server" and isServerActive and sound.Parent and os.clock()<deadline do
+                local ok, loaded, playing, length = pcall(function()
+                    return sound.IsLoaded, sound.IsPlaying, sound.TimeLength
+                end)
+                if ok and loaded and playing and length>0 then
+                    if currentSound==sound and currentMusicType=="server" and isServerActive and addSystemMessage then
+                        addSystemMessage(message, Color3.fromRGB(0,255,150))
+                    end
+                    return
+                end
+                task.wait(0.1)
+            end
+        end)
+    end
+
     playMusicSafe = function(assetId, mType, rawSoundId, startAtMs, resumeLateJoin)
         local clean = tostring(assetId):gsub("%D","")
         local scheduledStartMs = tonumber(startAtMs)
@@ -1958,7 +1979,7 @@ local function buildUI()
                 return
             end
             if mType=="server" then
-                sysMsg("🔊 SERVER: "..label.." BY "..string.upper(tostring(byName or player.DisplayName)), Color3.fromRGB(0,255,150))
+                reportServerPlaybackWhenActive(s, "🔊 SERVER: "..label.." BY "..string.upper(tostring(byName or player.DisplayName)))
             else
                 sysMsg("▶ Client: "..label, Color3.fromRGB(100,255,100))
             end
@@ -2593,8 +2614,8 @@ local function buildUI()
                 if addChatMessage then addChatMessage(player.DisplayName, payload.message, true, myRole, player.UserId, nil, nil, nil, nil, player.Name) end
                 task.spawn(function() pcall(function() httpPut(MUSIC_PRESENCE_URL, jsonEncode(payload)) end) end)
                 task.spawn(function() pcall(function() httpPost(FIREBASE_URL, jsonEncode(payload)) end) end)
-                playMusicSafe(id,"server",nil,startAt)
-                if addSystemMessage then addSystemMessage("🔊 SERVER ALL: "..id.." BY "..string.upper(player.DisplayName), Color3.fromRGB(0,255,150)) end
+                local serverSound = playMusicSafe(id,"server",nil,startAt)
+                reportServerPlaybackWhenActive(serverSound, "🔊 SERVER ALL: "..id.." BY "..string.upper(player.DisplayName))
             end)
         end)
         sS.MouseButton1Click:Connect(function()
@@ -2691,8 +2712,8 @@ local function buildUI()
                                         if addSystemMessage then addSystemMessage("📥 Song from "..tostring(fBy)..": "..tostring(fName), Color3.fromRGB(150,200,255)) end
                                         task.spawn(function() pcall(MX.playSynced, fHash, fName, "server", fBy, recvAt, playbackStartMs, resumeLateJoin==true) end)
                                     else
-                                        playMusicSafe(assetId,"server",nil,startAtMs)
-                                        if addSystemMessage then addSystemMessage("🔊 SERVER: "..tostring(assetId):gsub("%D","").." BY "..string.upper(data.by or "STAFF"), Color3.fromRGB(0,255,150)) end
+                                        local serverSound = playMusicSafe(assetId,"server",nil,startAtMs)
+                                        reportServerPlaybackWhenActive(serverSound, "🔊 SERVER: "..tostring(assetId):gsub("%D","").." BY "..string.upper(data.by or "STAFF"))
                                     end
                                 end
                             else
