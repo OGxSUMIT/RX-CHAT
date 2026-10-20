@@ -3670,24 +3670,22 @@ local function buildUI()
         local font = Enum.Font.GothamBold
         local textSize = 14
         local maxW, minW = 194, 51
-        local bounds = memoTextSize(display:sub(1,40), textSize, font, maxW-16)
+        local bounds = memoTextSize(display, textSize, font, maxW-16)
         local w, h
         if bounds then
             w = math.clamp(bounds.X+29, minW, maxW)
-            h = math.clamp(bounds.Y+20, 30, 85)
-            if bounds.Y>textSize+2 then h = math.clamp(bounds.Y+22,30,85) end
+            h = math.clamp(bounds.Y+22, 30, 110)
         else
             w = math.clamp(#display*6+29, minW, maxW)
             h = 34
         end
         local bill = Instance.new("BillboardGui")
         bill.Size=UDim2.new(0,w,0,h) bill.StudsOffset=Vector3.new(0,3.7,0)
-        bill.AlwaysOnTop=true bill.Adornee=char.Head bill.Parent=sg
-        bill.ClipsDescendants=false
+        bill.AlwaysOnTop=true bill.Adornee=char.Head bill.ClipsDescendants=true bill.Parent=sg
         activeBubbles[char]=bill
         local bg = Instance.new("Frame")
         bg.Size=UDim2.new(1,0,1,0) bg.BackgroundColor3=Color3.fromRGB(14,14,20)
-        bg.BackgroundTransparency=0.08 bg.BorderSizePixel=0 bg.Parent=bill
+        bg.BackgroundTransparency=0.08 bg.BorderSizePixel=0 bg.ClipsDescendants=true bg.Parent=bill
         local corner = Instance.new("UICorner")
         corner.CornerRadius=UDim.new(0,11) corner.Parent=bg
         local txt = Instance.new("TextLabel")
