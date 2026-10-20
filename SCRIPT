@@ -93,7 +93,7 @@ local MX = {
     token = 0, hashCache = {}, inflight = {}, inflightUp = {}, lastDedup = 0, library = {}, busy = false,
 }
 
-local MAX_MEME_BYTES = 900000
+local MAX_MEME_BYTES = 7400000 -- raw bytes; Base64 is about 9.87 MB, below RTDB's 10 MB string limit
 
 -- ==================================================================
 -- PERF TUNING (MAX SPEED)
