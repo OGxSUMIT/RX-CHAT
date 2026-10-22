@@ -2709,8 +2709,25 @@ local function buildUI()
                                         local playbackStartMs = tonumber(startAtMs)
                                         if (not playbackStartMs or playbackStartMs<1000000000000) and firstPresenceSnapshot then playbackStartMs=ts end
                                         local resumeLateJoin = firstPresenceSnapshot and playbackStartMs and playbackStartMs<sharedMusicClockMs()-500 or false
-                                        if addSystemMessage then addSystemMessage("📥 Song from "..tostring(fBy)..": "..tostring(fName), Color3.fromRGB(150,200,255)) end
-                                        task.spawn(function() pcall(MX.playSynced, fHash, fName, "server", fBy, recvAt, playbackStartMs, resumeLateJoin==true) end)
+                                        if addSystemMessage and not firstPresenceSnapshot then addSystemMessage("📥 Song from "..tostring(fBy)..": "..tostring(fName), Color3.fromRGB(150,200,255)) end
+                                        task.spawn(function()
+                                            pcall(MX.playSynced, fHash, fName, "server", fBy, recvAt, playbackStartMs, resumeLateJoin==true)
+                                            if firstPresenceSnapshot and addSystemMessage then
+                                                -- joined mid-session: only announce if the server song is actually live
+                                                local deadline = os.clock() + 20
+                                                while alive and isServerActive and currentMusicType=="server" and currentSound and os.clock()<deadline do
+                                                    local snd = currentSound
+                                                    local ok, loaded, playing, length = pcall(function() return snd.IsLoaded, snd.IsPlaying, snd.TimeLength end)
+                                                    if ok and loaded and playing and length>0 then
+                                                        if currentSound==snd and isServerActive then
+                                                            addSystemMessage("📥 Song from "..tostring(fBy)..": "..tostring(fName), Color3.fromRGB(150,200,255))
+                                                        end
+                                                        break
+                                                    end
+                                                    task.wait(0.1)
+                                                end
+                                            end
+                                        end)
                                     else
                                         local serverSound = playMusicSafe(assetId,"server",nil,startAtMs)
                                         reportServerPlaybackWhenActive(serverSound, "🔊 SERVER: "..tostring(assetId):gsub("%D","").." BY "..string.upper(data.by or "STAFF"))
