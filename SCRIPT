@@ -3897,6 +3897,47 @@ local function buildUI()
                         scrollToLatest()
                     end
                 end)
+                -- extra background retry: meme data may reach the server after the chat message; bypass the HTTP cache
+                task.spawn(function()
+                    task.wait(3)
+                    local tries = 0
+                    while loading.Parent and alive and tries<40 do
+                        tries = tries+1
+                        waitStickerFetch(stickerHash)
+                        local path = nil
+                        for _,fp in ipairs(listMemeFiles(true)) do
+                            if tostring(fp):find(stickerHash,1,true) then path = fp break end
+                        end
+                        if not path then
+                            local r = httpGetFresh(SYNCED_MEMES_ROOT.."/"..stickerHash..".json")
+                            local d = jsonDecode(r or "{}")
+                            if d and d.data and d.data~="" then
+                                local p = WORKSPACE_MEME_FOLDER.."/"..stickerHash..(d.ext or ".png")
+                                if not (isfile and isfile(p)) then
+                                    local raw = b64Decode(d.data)
+                                    if raw and dataHash(raw)==tostring(stickerHash) and writefile then
+                                        pcall(writefile, p, raw)
+                                        invalidateMemeListCache()
+                                    end
+                                end
+                                if isfile and isfile(p) then path = p end
+                            end
+                        end
+                        if path then
+                            local newId = pathToAsset(path)
+                            if newId and newId~="" and loading.Parent then
+                                loading:Destroy()
+                                local img = Instance.new("ImageLabel")
+                                img.Size=UDim2.new(0,180,0,180) img.BackgroundTransparency=1
+                                img.Image=newId img.ScaleType=Enum.ScaleType.Fit
+                                img.LayoutOrder=3 img.Parent=bubble
+                                scrollToLatest()
+                            end
+                            break
+                        end
+                        task.wait(3)
+                    end
+                end)
             else
                 local lbl = Instance.new("TextLabel")
                 lbl.Size=UDim2.new(0,180,0,24) lbl.BackgroundTransparency=1
@@ -4205,6 +4246,26 @@ local function buildUI()
                             syncedHashes[thisSticker.hash]=true
                         end
                     end
+                end
+                -- make sure the meme data exists on the server so other clients can load it
+                if thisSticker.hash and thisSticker.hash~="" then
+                    local upHash = tostring(thisSticker.hash)
+                    task.spawn(function()
+                        local foundPath = fileExistsForHash(upHash)
+                        if not foundPath or not readfile then return end
+                        local remote = jsonDecode(httpGetFresh(SYNCED_MEMES_ROOT.."/"..upHash..".json") or "{}")
+                        if remote and remote.data and remote.data~="" then return end
+                        local ok, data = pcall(readfile, foundPath)
+                        if ok and data and #data>0 and #data<=MAX_MEME_BYTES and dataHash(data)==upHash then
+                            local b64 = b64Encode(data)
+                            if b64 and b64~="" then
+                                local fname = tostring(foundPath):match("([^/\\]+)$") or "MEME"
+                                local nm = string.upper(fname:gsub("%.[^.]+$",""):gsub("%W","_"):sub(1,20))
+                                local ext = foundPath:match("%.[^%.]+$") or ".png"
+                                httpPut(SYNCED_MEMES_ROOT.."/"..upHash..".json", jsonEncode({name=nm, data=b64, hash=upHash, ext=ext, size=#data, by=player.Name, timestamp=os.time()*1000}))
+                            end
+                        end
+                    end)
                 end
                 task.wait(0.2)
                 local msgId = generateGUID()
